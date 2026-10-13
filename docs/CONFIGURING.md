@@ -1,7 +1,7 @@
 # Configuration guide
 
 Everything the tool does is driven by **one file per customer**:
-`customers/<name>.conf`. This guide explains every setting and gives a
+`~/.config/tunnelyard/customers/<name>.conf`. This guide explains every setting and gives a
 copy‑paste example for each kind of VPN, plus the extras (RDP, SSH, custom
 commands, 1Password).
 
@@ -32,6 +32,17 @@ commands, 1Password).
 
 ## How a customer config works
 
+- **Where it lives:** `~/.config/tunnelyard/`, outside the repo, so a `git pull` or a
+  fresh clone never touches it. Set `TUNNELYARD_CONFIG` to use another directory.
+
+  ```
+  ~/.config/tunnelyard/
+    customers/<name>.conf   one per customer
+    ssh/config              ssh shortcuts (see SSH shortcuts)
+    share.conf              jump host for sharing (see the README)
+    config/                 VPN profiles, certs, token seeds, config/secrets/*.psk
+    browser-profiles/       per-customer Firefox profiles, created on demand
+  ```
 - **One file per customer:** `customers/<name>.conf`. The `<name>` is what you
   type: `tunnelyard up <name>`, and it names the container `vpn-<name>`.
 - **Format:** plain `KEY=value`, one per line. **No quotes**, **no `$expansion`**,
@@ -46,16 +57,17 @@ commands, 1Password).
 - **Create one** by copying the template:
 
   ```bash
-  cp customers/_template.conf customers/acme.conf
+  mkdir -p ~/.config/tunnelyard/customers
+  cp customers/_template.conf ~/.config/tunnelyard/customers/acme.conf   # from the repo root
   tunnelyard edit acme            # opens it in $EDITOR (or edit the file directly)
   ```
 - **Passwords are never stored here.** You either type them at connect, or pull
   them from 1Password (see [below](#credentials-from-1password)).
-- **Configs are gitignored.** `customers/*.conf` stays on your machine; only
-  `customers/_template.conf` is committed. Same for `ssh/config`, PSKs and VPN
-  profiles.
+- **Nothing personal is in the repo.** It ships only the templates
+  (`customers/_template.conf`, `ssh/config.example`, `share.conf.example`).
 - **List what you have:** `tunnelyard list`.
-- **Somewhere else, if you want:** `VPN_CUSTOMERS` overrides the directory, so
+- **A second set, if you want:** `VPN_CUSTOMERS` overrides just the customers
+  directory, so
   you can keep a second set (a demo, a colleague's export) without disturbing
   your own. `docs/demo-customers/` ships an invented set:
 
@@ -110,7 +122,7 @@ the 1100+ range; `tunnelyard list` shows what's already taken.
 | `VPN_AUTHGROUP` | Tunnel group / realm, if the gateway shows a menu. |
 | `VPN_OS` | OS reported to the gateway: `mac-intel`, `linux-64`, `win`, … Some policies gate on it. |
 | `VPN_COOKIE` | `1` = authenticate with a session cookie pasted on stdin instead of user/pass (see [F5](#f5-big-ip-apm)). |
-| `VPN_CERT` / `VPN_KEY` | Client-certificate auth. Put the files under `./config` (mounted at `/config`). |
+| `VPN_CERT` / `VPN_KEY` | Client-certificate auth. Put the files in `~/.config/tunnelyard/config` (mounted at `/config`). |
 | `VPN_SERVERCERT` | Pin the gateway cert, e.g. `pin-sha256:…`. openconnect prints the value to use on first connect. |
 | `VPN_EXTRA` | Extra flags passed verbatim to the client (word-split, no quoting). e.g. `--no-dtls`, `--csd-wrapper=…`. |
 
@@ -129,13 +141,13 @@ the 1100+ range; `tunnelyard list` shows what's already taken.
 | `VPN_IKE_PROPOSAL` | Phase‑1 proposals, e.g. `aes256-sha256-modp1536`. |
 | `VPN_ESP_PROPOSAL` | Phase‑2 proposals, e.g. `aes256-sha256`. |
 | `VPN_DPD` | Dead‑peer‑detection action (`clear`, `restart`, `none`). |
-| PSK | **Not** in the config — a gitignored `config/secrets/<name>.psk` file, or prompted. |
+| PSK | **Not** in the config — a `config/secrets/<name>.psk` file in your config directory, or prompted. |
 
 ### openvpn / wireguard
 
 | Key | Meaning |
 |---|---|
-| `VPN_CONFIG` | Path (inside the container) to the profile, e.g. `/config/client.ovpn` or `/config/wg.conf`. Put the file under `./config`. |
+| `VPN_CONFIG` | Path (inside the container) to the profile, e.g. `/config/client.ovpn` or `/config/wg.conf`. Put the file in `~/.config/tunnelyard/config`. |
 
 ### Routing / DNS
 
@@ -326,12 +338,12 @@ VPN_ESP_PROPOSAL=aes256-sha256
 VPN_DPD=clear
 ```
 
-The **pre-shared key** is never in the config. Provide it either as a gitignored
-file or let the container prompt:
+The **pre-shared key** is never in the config. Provide it either as a file or
+let the container prompt:
 
 ```bash
-mkdir -p config/secrets
-printf '%s' 'THE-GROUP-PSK' > config/secrets/acme.psk   # or <group>.psk
+mkdir -p ~/.config/tunnelyard/config/secrets
+printf '%s' 'THE-GROUP-PSK' > ~/.config/tunnelyard/config/secrets/acme.psk   # or <group>.psk
 ```
 
 Your XAuth password is always prompted (or from 1Password).
@@ -346,11 +358,11 @@ VPN_CONFIG=/config/acme.ovpn
 
 ```bash
 # put the profile (and any certs it references) where the container can read it:
-mkdir -p config
-cp ~/Downloads/acme.ovpn config/acme.ovpn
+mkdir -p ~/.config/tunnelyard/config
+cp ~/Downloads/acme.ovpn ~/.config/tunnelyard/config/acme.ovpn
 ```
 
-`./config` is mounted read-only at `/config` inside the container.
+`~/.config/tunnelyard/config` is mounted read-only at `/config` inside the container.
 
 ### WireGuard
 
@@ -361,7 +373,7 @@ VPN_CONFIG=/config/acme-wg.conf
 ```
 
 ```bash
-cp ~/Downloads/acme.conf config/acme-wg.conf
+cp ~/Downloads/acme.conf ~/.config/tunnelyard/config/acme-wg.conf
 ```
 
 > Drop any `DNS =` line that points at a resolver you can't reach, and keep
@@ -403,14 +415,15 @@ is published on `127.0.0.1`, so `localhost:2575` behaves like the customer host.
 
 ### SSH shortcuts
 
-Keep SSH targets in the repo, not your global `~/.ssh/config`:
+Keep SSH targets with your configs, not in your global `~/.ssh/config`:
 
 ```bash
-cp ssh/config.example ssh/config      # gitignored; holds internal IPs/users
+mkdir -p ~/.config/tunnelyard/ssh
+cp ssh/config.example ~/.config/tunnelyard/ssh/config      # from the repo root
 ```
 
 ```conf
-# ssh/config
+# ~/.config/tunnelyard/ssh/config
 Host acme-app
     HostName 10.20.5.40
     User jdoe
@@ -464,7 +477,8 @@ CMD_console=@host "$ROOT"/libexec/open-manager acme 1081 https://console.acme.in
 ```
 
 `libexec/open-manager <customer> <socks-port> <url>` is the helper for exactly
-that case: it opens Firefox on a dedicated profile under `browser-profiles/`,
+that case: it opens Firefox on a dedicated profile under
+`~/.config/tunnelyard/browser-profiles/`,
 pinned to that tunnel's SOCKS port **with remote DNS**. Remote DNS is the point —
 internal hostnames usually have no public record, so the name has to be resolved
 by the customer's resolvers inside the tunnel. A per-customer profile also means
@@ -531,27 +545,46 @@ environment or `docker inspect`. If a gateway's 2FA prompt isn't recognised, set
 
 ## Sharing your configs
 
-A config carries no passwords, but it does carry your account at the customer
-(`VPN_USER`, `RDP_USER`) and a pointer into your own 1Password vault
-(`OP_ITEM`) — all per-person. It also carries gateway hostnames and internal
-addresses, which is why `customers/*.conf` is gitignored and should stay that
-way.
+A config carries no passwords, but it does carry your accounts at the customer
+(`VPN_USER`, `RDP_USER`) and pointers into your own 1Password (`OP_ITEM`), all
+per-person. It also carries gateway hostnames and internal addresses, which is
+why it lives outside the repo.
 
 To hand the useful part to a colleague:
 
 ```bash
-./libexec/export-configs ~/Downloads/vpn-configs.tar.gz
+tunnelyard export          # writes ~/Downloads/tunnelyard-configs-<date>.tar.gz
 ```
 
-That strips those three fields — wherever they appear, including inside
-comments, not merely on their own lines — and verifies the finished tarball,
-exiting non-zero if anything survived. What is kept is the part worth sharing:
-gateway hostnames, protocols, ports, forwards, health probes, `CMD_` entries and
-every comment explaining a gateway's quirks. The recipient drops the files into
-their own `customers/` and fills in their own three fields.
+That bundles `customers/`, `ssh/config` and `share.conf` and removes, wherever
+they appear, comments and commands included: your usernames, password- and
+secret-type values, `OP_ITEM` values, `op://` references, 1Password item names
+quoted in comments, RSA token file names, your git email and your name in its
+usual username spellings. Only whole values are replaced, so customer names
+inside hostnames survive. `config/` (profiles, token seeds, PSKs) and
+`browser-profiles/` are never exported.
+
+The export re-reads the finished tarball and refuses, deleting it, if anything
+personal survived. It lists any setting that changed beyond a personal field, so
+you can check it before you upload.
+
+The recipient installs it with:
+
+```bash
+tunnelyard import ~/Downloads/tunnelyard-configs-<date>.tar.gz
+```
+
+That puts the files where tunnelyard reads them, `~/.config/tunnelyard/` or
+`TUNNELYARD_CONFIG`. It never overwrites a file that already exists, so a
+second import keeps their own usernames and lists the files it left alone. It
+checks the archive before writing anything and refuses links, absolute paths and
+anything outside the export's layout. It ends by listing any setting that still
+holds a placeholder and any `SOCKS_PORT` two customers share. They then fill in
+their own `VPN_USER` (and `RDP_USER`, `OP_ITEM`) per customer with
+`tunnelyard edit <customer>`.
 
 The result still lists customer gateways and internal IPs, so put it in
-1Password or an equivalent access-controlled store — not in git.
+1Password or an equivalent access-controlled store, never in git.
 
 ---
 

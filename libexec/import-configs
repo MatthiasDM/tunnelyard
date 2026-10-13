@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Install a colleague's config export where tunnelyard reads it.
+
+Usage: tunnelyard import <tunnelyard-configs-<date>.tar.gz | unpacked folder>
+
+Puts customers/*.conf, ssh/config and share.conf into your config directory
+(TUNNELYARD_CONFIG, default ~/.config/tunnelyard). It never overwrites a file
+you already have, so your own usernames survive a second import; the files it
+kept are listed.
+
+Everything is checked before anything is written. Absolute paths, ".." parts,
+links, special files and anything outside the export's own layout are refused,
+so a tampered archive cannot write outside the config directory.
+"""
+import os, pathlib, re, sys, tarfile
+
+HOME = pathlib.Path.home()
+CONF = pathlib.Path(os.environ.get("TUNNELYARD_CONFIG") or
+                    pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "tunnelyard")
+CUSTOMERS = pathlib.Path(os.environ.get("VPN_CUSTOMERS") or CONF / "customers")
+LAYOUT = re.compile(r"^(customers/[A-Za-z0-9][A-Za-z0-9._-]*\.conf|ssh/config|share\.conf|README\.txt)$")
+MAX = 1 << 20      # a config file is a few KB; anything this big is not one
+
+
+def shown(p):
+    s, h = str(p), str(HOME)
+    return "~" + s[len(h):] if s.startswith(h + "/") else s
+
+
+def die(msg):
+    sys.exit(f"tunnelyard import: {msg}")
+
+
+def relpath(name, src):
+    """'tunnelyard/customers/x.conf' -> 'customers/x.conf', or refuse."""
+    if name.startswith("/") or "\\" in name:
+        die(f"refusing {src}: unsafe path {name!r}")
+    parts = pathlib.PurePosixPath(name).parts
+    if ".." in parts:
+        die(f"refusing {src}: unsafe path {name!r}")
+    if not parts or parts[0] != "tunnelyard":
+        die(f"{src} is not a tunnelyard export (expected everything under tunnelyard/)")
+    return "/".join(parts[1:])
+
+
+def read_tar(path):
+    files, ignored = {}, []
+    try:
+        tar = tarfile.open(path, "r:*")
+    except (tarfile.TarError, OSError):
+        die(f"cannot read {path.name}: not a tar or tar.gz archive")
+    with tar:
+        for m in tar.getmembers():
+            rel = relpath(m.name, path.name)
+            if m.isdir() or not rel:
+                continue
+            if not m.isfile():
+                die(f"refusing {path.name}: {m.name!r} is a link or special file")
+            if m.size > MAX:
+                die(f"refusing {path.name}: {m.name!r} is too large to be a config file")
+            if LAYOUT.match(rel):
+                files[rel] = tar.extractfile(m).read()
+            else:
+                ignored.append(rel)
+    return files, ignored
+
+
+def read_dir(path):
+    root = path / "tunnelyard" if (path / "tunnelyard").is_dir() else path
+    files, ignored = {}, []
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if p.is_symlink():
+            die(f"refusing {path}: {rel!r} is a link")
+        if p.is_dir():
+            continue
+        if not p.is_file():
+            die(f"refusing {path}: {rel!r} is a special file")
+        if p.stat().st_size > MAX:
+            die(f"refusing {path}: {rel!r} is too large to be a config file")
+        if LAYOUT.match(rel):
+            files[rel] = p.read_bytes()
+        elif p.name != ".DS_Store":
+            ignored.append(rel)
+    return files, ignored
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        sys.exit("usage: tunnelyard import <tunnelyard-configs-<date>.tar.gz | unpacked folder>")
+    src = pathlib.Path(sys.argv[1]).expanduser()
+    if not src.exists():
+        die(f"no such file: {src}")
+    files, ignored = read_dir(src) if src.is_dir() else read_tar(src)
+    if not any(r.startswith("customers/") for r in files):
+        die(f"{src.name} holds no customer configs -- is it a tunnelyard export?")
+    for rel, data in files.items():
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            die(f"refusing {src.name}: {rel} is not a text file")
+
+    # Validated. Only now touch the disk.
+    os.umask(0o077)
+    added, kept = [], []
+    for rel, data in sorted(files.items()):
+        if rel == "README.txt":
+            continue
+        dest = CUSTOMERS / rel.split("/", 1)[1] if rel.startswith("customers/") else CONF / rel
+        if dest.exists() or dest.is_symlink():
+            kept.append(rel)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "xb") as f:          # x: never overwrite, even in a race
+            f.write(data)
+        added.append(rel)
+
+    n_new = sum(r.startswith("customers/") for r in added)
+    rest = [r for r in added if not r.startswith("customers/")]
+    print(f"imported into {shown(CONF)}")
+    print(f"  added: {n_new} customer config{'s' if n_new != 1 else ''}" + "".join(f", {r}" for r in rest))
+    if kept:
+        print("  kept yours, not overwritten: " + ", ".join(kept))
+    if ignored:
+        print("  ignored, not part of a config export: " + ", ".join(ignored))
+
+    # Lines that are settings, not comments, and still hold a placeholder.
+    todo = []
+    for rel in added:
+        dest = CUSTOMERS / rel.split("/", 1)[1] if rel.startswith("customers/") else CONF / rel
+        for i, line in enumerate(dest.read_text().splitlines(), 1):
+            if not line.lstrip().startswith("#") and re.search(r"<you(r-[a-z0-9-]+)?>", line):
+                todo.append(f"    {rel}:{i}: {line.strip()[:90]}")
+
+    # Two customers on one SOCKS_PORT cannot be up at the same time.
+    ports = {}
+    for f in sorted(CUSTOMERS.glob("*.conf")):
+        if f.name.startswith("_"):
+            continue
+        m = re.search(r"^SOCKS_PORT=(\d+)", f.read_text(), re.M)
+        if m:
+            ports.setdefault(m.group(1), []).append(f.stem)
+    clashes = {p: n for p, n in ports.items() if len(n) > 1}
+
+    print()
+    print("next: set your own login per customer you use, with `tunnelyard edit <customer>`:")
+    print("  VPN_USER, and RDP_USER or OP_ITEM where you use them")
+    if todo:
+        print("  these settings still hold a placeholder to replace:")
+        print("\n".join(todo))
+    for p, names in sorted(clashes.items()):
+        print(f"warning: SOCKS_PORT {p} is shared by {', '.join(names)} -- change one before running them together")
+    print("then: tunnelyard list")
+
+
+main()

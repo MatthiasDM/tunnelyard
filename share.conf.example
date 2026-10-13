@@ -1,5 +1,6 @@
 # Config for `tunnelyard share` -- exposing a connected tunnel's SOCKS proxy to a
-# teammate through a jump host you both can reach. Copy to share.conf and edit.
+# teammate through a jump host you both can reach. Copy to
+# ~/.config/tunnelyard/share.conf and edit.
 #
 # How it works: `tunnelyard share <customer>` reverse-forwards that customer's local
 # SOCKS proxy up to the jump host; your teammate pulls it back down and points

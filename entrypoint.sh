@@ -2,7 +2,7 @@
 # Runs one customer VPN inside this container's network namespace and exposes it
 # to the host as a SOCKS5 proxy plus any fixed TCP forwards.
 #
-# Driven entirely by environment (see customers/_template.env).
+# Driven entirely by environment (see customers/_template.conf in the repo).
 set -eu
 
 NAME="${VPN_NAME:-vpn}"
@@ -307,7 +307,7 @@ connect_strongswan() {
     : "${VPN_USER:?VPN_USER (XAuth identity) is required}"
     conn="${VPN_NAME:-vpn}"
 
-    # Group pre-shared key: from a gitignored secret file if the user created
+    # Group pre-shared key: from config/secrets/ in the user's config dir if
     # one, otherwise prompted. Never baked into the image or the customer conf.
     psk=""
     for secret_file in "/config/secrets/${VPN_NAME}.psk" "/config/secrets/${VPN_IKE_GROUP}.psk"; do

@@ -1,5 +1,5 @@
 # SSH shortcuts for customer internal hosts, reached through the per-customer
-# SOCKS proxy. Copy this file to ssh/config and edit.
+# SOCKS proxy. Copy this file to ~/.config/tunnelyard/ssh/config and edit.
 #
 #   tunnelyard up <customer>        # bring the tunnel up first
 #   tunnelyard ssh <host-alias>     # then ssh through it

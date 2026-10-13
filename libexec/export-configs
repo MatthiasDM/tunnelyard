@@ -1,112 +1,245 @@
 #!/usr/bin/env python3
-"""Export the customer configs with personal identifiers stripped, as a tarball
-suitable for storing in 1Password.
+"""Export your tunnelyard config minus everything personal, as a tarball to
+keep in 1Password and hand to a colleague.
 
-Usage: export-configs [output.tar.gz]
+Usage: tunnelyard export [output.tar.gz]
+       (default: ~/Downloads/tunnelyard-configs-<date>.tar.gz)
 
-REMOVED (identity -- each person supplies their own):
-    VPN_USER, RDP_USER   your account at the customer
-    OP_ITEM              points at items in your own 1Password vault
+Reads the config directory (TUNNELYARD_CONFIG, default ~/.config/tunnelyard):
+customers/*.conf, ssh/config and share.conf. Never exported: config/ (VPN
+profiles, token seeds, PSKs) and browser-profiles/ (cookies, sessions).
 
-Those values are also redacted wherever else they appear, including inside
-comments -- blanking only the KEY= lines leaves them in the prose, which is how
-the first version of this script leaked them.
+Removed, because each person has their own:
+  VPN_USER, RDP_USER, SHARE_NAME   your accounts and display name
+  OP_ITEM                          pointers into your 1Password
+  *_PASSWORD, *_PASS, *_SECRET, *_PSK values and inline --token-secret= seeds
+Those values are also replaced wherever else they appear, comments and commands
+included, as are op:// references, item titles quoted in comments about
+1Password, RSA token file names (they carry the token serial), your git email,
+and your name from `git config user.name` in its usual username spellings
+(Ann Smith also covers smith, asmith, a.smith and annsmith).
 
-KEPT (the part worth sharing -- how each gateway actually behaves): gateway
-hostnames, protocol/kind, SOCKS ports, FORWARDS, HEALTH_PROBE, CMD_ entries
-(shared service accounts, not personal ones), and every comment.
+Kept, because it is the part worth sharing: gateways, protocols, ports,
+forwards, health probes, CMD_ entries, ssh host blocks and their shared service
+accounts, the team jump host, and every comment on a gateway's quirks.
 
-Still contains customer gateway hostnames and internal IPs, so it belongs in
-1Password or an equivalent access-controlled store -- NOT in git.
+Only whole values are replaced, never the words inside them. An earlier version
+split usernames and item titles into words and redacted each word everywhere,
+which turned customer names inside gateway hostnames into placeholders.
+
+The finished tarball is re-read and checked. A surviving identity value, name
+spelling or 1Password reference fails the export and deletes the tarball.
+Settings that changed beyond a personal field are listed for a human to check.
 """
-import datetime, pathlib, re, shutil, sys, tarfile, tempfile
+import datetime, io, os, pathlib, re, subprocess, sys, tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-IDENTITY = {"VPN_USER": "<your-username>", "RDP_USER": "<your-username>",
-            "OP_ITEM": "<your-1password-item>"}
+HOME = pathlib.Path.home()
+CONF = pathlib.Path(os.environ.get("TUNNELYARD_CONFIG") or
+                    pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "tunnelyard")
+CUSTOMERS = pathlib.Path(os.environ.get("VPN_CUSTOMERS") or CONF / "customers")
 
-confs = sorted(ROOT.glob("customers/*.conf"))
-if not confs:
-    sys.exit("no customer configs found")
 
-# Collect every identity value in use, longest first so that e.g. "jdoe.adm"
-# is redacted before the shorter "jdoe" can match inside it.
-secrets = {}
-for f in confs:
-    for line in f.read_text().splitlines():
-        m = re.match(r"\s*(VPN_USER|RDP_USER|OP_ITEM)=(.+)", line)
-        if m and m.group(2).strip():
-            secrets[m.group(2).strip()] = IDENTITY[m.group(1)]
-order = sorted(secrets, key=len, reverse=True)
+def shown(p):
+    s, h = str(p), str(HOME)
+    return "~" + s[len(h):] if s.startswith(h + "/") else s
 
-# Values alone are not enough. Two cases leak past them:
-#   * an op:// reference named in a COMMENT while that config's OP_ITEM= is
-#     blank, so it never enters `secrets`;
-#   * a bare 1Password item title in prose, like "Acme jdoe", which is not the
-#     full reference but still carries a personal name.
+
+def git(key):
+    try:
+        return subprocess.run(["git", "config", key], capture_output=True,
+                              text=True, cwd=ROOT).stdout.strip()
+    except OSError:
+        return ""
+
+
+# --- what goes in -----------------------------------------------------------
+
+sources = [(p, "customers/" + p.name) for p in sorted(CUSTOMERS.glob("*.conf"))
+           if not p.name.startswith("_")]
+if not sources:
+    sys.exit(f"export: no customer configs in {shown(CUSTOMERS)}")
+for rel in ("ssh/config", "share.conf"):
+    if (CONF / rel).is_file():
+        sources.append((CONF / rel, rel))
+texts = {arc: p.read_text() for p, arc in sources}
+
+# --- what counts as personal ------------------------------------------------
+
+BLANK = ("VPN_USER", "RDP_USER", "SHARE_NAME", "OP_ITEM")
+SECRET_KEY = re.compile(r"(?:^|_)(?:PASSWORD|PASS|SECRET|PSK)$")
+ASSIGN = re.compile(r"^(\s*#?\s*)([A-Z][A-Z0-9_]*)=(.*)$")
+
+values = {}    # literal -> placeholder, replaced wherever it appears
+for text in texts.values():
+    for line in text.splitlines():
+        m = ASSIGN.match(line)
+        if not m or m.group(1).strip():          # live lines define the values
+            continue
+        key, val = m.group(2), m.group(3).strip()
+        if not val:
+            continue
+        if key in ("VPN_USER", "RDP_USER"):
+            values[val] = "<your-username>"
+            if "\\" in val:                       # DOMAIN\user: the user alone too
+                values[val.split("\\", 1)[1]] = "<your-username>"
+        elif key == "OP_ITEM":
+            values[val] = "<your-1password-item>"
+            parts = val[len("op://"):].split("/") if val.startswith("op://") else ["", val]
+            title = parts[1] if len(parts) > 1 else ""
+            # A one-word title is usually just the customer's name, and
+            # replacing that everywhere is the over-redaction described above.
+            if " " in title.strip() or re.fullmatch(r"[a-z0-9]{26}", title):
+                values[title] = "<your-1password-item>"
+        elif SECRET_KEY.search(key):
+            values[val] = "<secret>"
+email = git("user.email")
+if email:
+    values[email] = "<your-email>"
+order = sorted((v for v in values if len(v) >= 4), key=len, reverse=True)
+short = sorted(v for v in values if len(v) < 4)
+
+
+def bounded(p):
+    return re.compile(r"(?<![A-Za-z])(?:%s)(?![A-Za-z])" % p, re.I)
+
+
+words = re.findall(r"[A-Za-z]+", git("user.name"))
+NAMES = []
+if words:
+    first, rest = words[0], words[1:]
+    sep, initial = r"[ ._-]?", r"(?:[a-z][._-]?)?"
+    if rest:
+        NAMES.append(bounded(sep.join(map(re.escape, words))))       # full name
+        NAMES.append(bounded(initial + sep.join(map(re.escape, rest))))  # surname
+        if len(rest) > 1 and len(rest[-1]) >= 3:
+            NAMES.append(bounded(initial + re.escape(rest[-1])))     # last word
+    if len(first) >= 3:
+        NAMES.append(bounded(re.escape(first) + (r"[a-z]?" if len(first) >= 5 else "")))
+
 OP_REF = re.compile(r"op://[^\s)\"',]+")
+SDTID = re.compile(r"[\w.-]+\.sdtid\b")
+TOKEN_SECRET = re.compile(r"(--token-secret=)(?!@)(?!<)\S+")
+OP_TALK = re.compile(r"1password|op://|\bitem\b|\bentry\b", re.I)
+QUOTED = re.compile(r'"([^"\n]*[A-Za-z][^"\n]*)"')
 
-# Personal name fragments, from git's configured user. Length-filtered so short
-# particles ("De") cannot mangle unrelated words.
-import subprocess
-try:
-    who = subprocess.run(["git", "config", "user.name"], capture_output=True,
-                         text=True, cwd=ROOT).stdout
-except Exception:
-    who = ""
-NAMES = [re.compile(re.escape(t), re.I)
-         for t in re.findall(r"[A-Za-z]{5,}", who + " " + " ".join(order))]
 
 def scrub(text):
     out = []
     for line in text.splitlines():
-        m = re.match(r"(\s*(?:VPN_USER|RDP_USER|OP_ITEM)=)", line)
-        line = m.group(1) if m else line
-        for val in order:                       # literal, not regex
-            line = line.replace(val, secrets[val])
+        m = ASSIGN.match(line)
+        if m and (m.group(2) in BLANK or SECRET_KEY.search(m.group(2))):
+            out.append(f"{m.group(1)}{m.group(2)}=")    # key stays, as a prompt
+            continue
+        line = SDTID.sub("<your-token>.sdtid", line)
+        line = TOKEN_SECRET.sub(r"\1<secret>", line)
+        for v in order:
+            line = line.replace(v, values[v])
         line = OP_REF.sub("<your-1password-item>", line)
+        if line.lstrip().startswith("#") and OP_TALK.search(line):
+            line = QUOTED.sub('"<your-1password-item>"', line)
         for rx in NAMES:
             line = rx.sub("<you>", line)
         out.append(line)
     return "\n".join(out) + "\n"
 
-out_path = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "vpn-configs.tar.gz")
-stage = pathlib.Path(tempfile.mkdtemp())
-try:
-    bundle = stage / "vpn-configs"
-    (bundle / "customers").mkdir(parents=True)
-    for f in confs:
-        (bundle / "customers" / f.name).write_text(scrub(f.read_text()))
-    ssh = ROOT / "ssh" / "config"
-    if ssh.exists():
-        (bundle / "ssh-config").write_text(scrub(ssh.read_text()))
-    (bundle / "README.txt").write_text(
-        "VPN tunnel configs -- exported "
-        f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC}\n\n"
-        "Drop customers/*.conf into the vpn repo's customers/ directory, and\n"
-        "ssh-config into ssh/config. Then fill in, per customer:\n\n"
-        "  VPN_USER    your own account at that customer\n"
-        "  RDP_USER    likewise, where RDP is used\n"
-        "  OP_ITEM     an op:// reference to YOUR 1Password item\n\n"
-        "Those were stripped on export because they are per-person; they are\n"
-        "marked <your-username> / <your-1password-item> where they appeared.\n"
-        "Everything else -- gateway hostnames, protocols, ports, forwards,\n"
-        "health probes and the comments explaining each gateway's quirks -- is\n"
-        "as-is.\n\n"
-        "Contains customer gateway hostnames and internal IP addresses. Keep it\n"
-        "in 1Password; do not commit it to git.\n")
-    with tarfile.open(out_path, "w:gz") as t:
-        t.add(bundle, arcname="vpn-configs")
-finally:
-    shutil.rmtree(stage, ignore_errors=True)
 
-# Verify against the live values rather than trusting the transform.
-with tarfile.open(out_path) as t:
-    blob = "".join(t.extractfile(m).read().decode("utf-8", "replace")
-                   for m in t.getmembers() if m.isfile())
-leaks = [v for v in order if v in blob]
-print(f"wrote {out_path}")
-if leaks:
-    print("!! STILL PRESENT, do NOT upload: " + ", ".join(leaks))
+scrubbed = {arc: scrub(t) for arc, t in texts.items()}
+
+# --- report what changed ----------------------------------------------------
+
+blanked = comments = 0
+review = []
+for arc, before in texts.items():
+    for a, b in zip(before.splitlines(), scrubbed[arc].splitlines()):
+        if a == b:
+            continue
+        m = ASSIGN.match(a)
+        if m and (m.group(2) in BLANK or SECRET_KEY.search(m.group(2))):
+            blanked += 1
+        elif a.lstrip().startswith("#"):
+            comments += 1
+        else:
+            review.append(f"  {arc}: {b.strip()[:100]}")
+
+# --- write ------------------------------------------------------------------
+
+stamp = datetime.datetime.now(datetime.timezone.utc)
+if len(sys.argv) > 1:
+    out = pathlib.Path(sys.argv[1]).expanduser().resolve()
+else:
+    base = HOME / "Downloads" if (HOME / "Downloads").is_dir() else HOME
+    out = base / f"tunnelyard-configs-{stamp:%Y-%m-%d}.tar.gz"
+if out == ROOT or ROOT in out.parents:
+    sys.exit("export: refusing to write inside the repo -- pick a path outside it")
+
+readme = f"""tunnelyard config -- exported {stamp:%Y-%m-%d %H:%M} UTC
+
+Install it (first time, or to pick up customers you don't have yet):
+
+    tunnelyard import {out.name}
+
+That puts it in ~/.config/tunnelyard/, where tunnelyard reads it, and never
+overwrites a file you already have, so your own usernames survive a second
+import. On a checkout too old to have `import`, run `git pull` first.
+
+Then fill in your own, per customer, with `tunnelyard edit <customer>`:
+
+    VPN_USER   your account at that customer
+    RDP_USER   likewise, where RDP is used
+    OP_ITEM    optional: your own 1Password item for auto-fill
+
+They were removed on export. Where they appeared in comments or commands they
+now read <your-username>, <your-1password-item> or <you>.
+
+Not included, bring your own into ~/.config/tunnelyard/config/: VPN profiles,
+RSA token seeds and IPsec PSKs. Browser profiles are not included either.
+
+This still lists customer gateways and internal IP addresses. Keep it in
+1Password; never commit it to git.
+"""
+
+os.umask(0o077)
+with tarfile.open(out, "w:gz") as tar:
+    for d in ("tunnelyard", "tunnelyard/customers", "tunnelyard/ssh"):
+        if d.endswith("/ssh") and "ssh/config" not in scrubbed:
+            continue
+        info = tarfile.TarInfo(d)
+        info.type, info.mode, info.mtime = tarfile.DIRTYPE, 0o700, int(stamp.timestamp())
+        tar.addfile(info)
+    for arc, data in [("README.txt", readme)] + sorted(scrubbed.items()):
+        raw = data.encode()
+        info = tarfile.TarInfo("tunnelyard/" + arc)
+        info.size, info.mode, info.mtime = len(raw), 0o600, int(stamp.timestamp())
+        tar.addfile(info, io.BytesIO(raw))   # uid/gid 0, no user or group name
+
+# --- verify the tarball itself, not the transform ---------------------------
+
+with tarfile.open(out) as tar:
+    blob = "".join(tar.extractfile(m).read().decode("utf-8", "replace")
+                   for m in tar.getmembers() if m.isfile() and not m.name.endswith("README.txt"))
+    owners = {(m.uname, m.gname) for m in tar.getmembers()}
+fail = [f"identity value {v!r}" for v in order if v in blob]
+fail += [f"your name ({m.group(0)!r})" for rx in NAMES for m in [rx.search(blob)] if m]
+fail += [f"1Password reference {r!r}" for r in OP_REF.findall(blob)]
+fail += [f"token file {t!r}" for t in SDTID.findall(blob) if t != "<your-token>.sdtid"]
+fail += [f"token secret {t!r}" for t in TOKEN_SECRET.findall(blob)]
+fail += [f"tar owner {o!r}" for o in owners if o != ("", "")]
+warn = [v for v in short if re.search(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])", blob)]
+
+n_cust = sum(a.startswith("customers/") for a in scrubbed)
+extra = [a for a in ("ssh/config", "share.conf") if a in scrubbed]
+if fail:
+    out.unlink()
+    print("export FAILED, tarball deleted. Still present:")
+    print("\n".join("  " + f for f in fail))
     sys.exit(1)
-print(f"verified: none of the {len(order)} identity values appear anywhere in the bundle")
+print(f"wrote {shown(out)}")
+print(f"  {n_cust} customers" + "".join(f", {a}" for a in extra))
+print(f"  removed {blanked} personal fields and {comments} mentions in comments")
+if review:
+    print("  check these settings, which changed beyond a personal field:")
+    print("\n".join(review))
+if warn:
+    print("  values too short to replace safely, check by hand: " + ", ".join(warn))
+print("verified: no username, password, 1Password reference or spelling of your name remains")

@@ -48,16 +48,27 @@ Then:
 ```
 
 That builds the image and verifies the tun device, the SOCKS proxy and a TCP
-forward end to end, without touching a real VPN. Put `bin/` on your PATH, or
-symlink `bin/tunnelyard` into `~/.local/bin`.
+forward end to end, without touching a real VPN.
+
+Then make `tunnelyard` work from any directory. From the repo root:
+
+```bash
+mkdir -p ~/.local/bin && ln -sf "$PWD/bin/tunnelyard" ~/.local/bin/tunnelyard
+```
+
+If a new terminal then says `tunnelyard: command not found`, `~/.local/bin` is
+not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`
+(or `~/.bashrc`). The link follows the repo, so a `git pull` is all an update
+takes.
 
 ## Start here: the TUI
 
 ```bash
-tunnelyard tui
+tunnelyard
 ```
 
-This is how you drive it day to day — the CLI below exists for scripting and for
+Run with no command in a terminal, `tunnelyard` opens the TUI (the same as
+`tunnelyard tui`). This is how you drive it day to day — the CLI below exists for scripting and for
 the things a list can't express. Arrow through the customers; the pane on the
 right shows the highlighted one's state, tunnel IP, routes and recent log, live.
 
@@ -123,8 +134,10 @@ console if the client asks to re-authenticate.
 > each gateway type (AnyConnect, GlobalProtect, Ivanti/Pulse, FortiGate, F5,
 > IPsec, OpenVPN, WireGuard), plus RDP, SSH, custom commands and 1Password.
 
-Copy `customers/_template.conf` to `customers/<name>.conf`, set a unique
-`SOCKS_PORT`, and pick the protocol matching the vendor client you are replacing:
+Your configs live outside the repo, in `~/.config/tunnelyard/` (set `TUNNELYARD_CONFIG` to
+keep them elsewhere). Copy the repo's `customers/_template.conf` to
+`~/.config/tunnelyard/customers/<name>.conf`, set a unique `SOCKS_PORT`, and pick the
+protocol matching the vendor client you are replacing:
 
 | Vendor client | `VPN_KIND` / `VPN_PROTOCOL` |
 |---|---|
@@ -137,11 +150,12 @@ Copy `customers/_template.conf` to `customers/<name>.conf`, set a unique
 | OpenVPN Connect | `openvpn` |
 | WireGuard | `wireguard` |
 
-The files already in `customers/` are pre-wired per vendor with non-colliding
-ports — rename them to the actual customer and fill in `VPN_SERVER`.
+Got an export from a colleague? `tunnelyard import <file>` puts it in place
+without overwriting anything you have; see "Sharing your configs" in
+[docs/CONFIGURING.md](docs/CONFIGURING.md).
 
-`openvpn` and `wireguard` read their profile from `./config`, mounted read-only
-at `/config`.
+`openvpn` and `wireguard` read their profile from `~/.config/tunnelyard/config`, mounted
+read-only at `/config`.
 
 ## Reaching things
 
@@ -166,8 +180,9 @@ Both ports are published on `127.0.0.1`, so anything on your machine talks to
 `localhost:2575` as if it were on the customer LAN. No proxy configuration
 anywhere. For most day-to-day work this beats SOCKS.
 
-**SSH to internal hosts** — shortcuts live in the repo, not `~/.ssh/config`.
-Copy `ssh/config.example` to `ssh/config`, add a `Host` block per server (its
+**SSH to internal hosts** — shortcuts live with your configs, not in
+`~/.ssh/config`. Copy the repo's `ssh/config.example` to `~/.config/tunnelyard/ssh/config`,
+add a `Host` block per server (its
 `ProxyCommand` port is the customer's `SOCKS_PORT` from `tunnelyard list`), then:
 
 ```bash
@@ -175,10 +190,9 @@ tunnelyard up northgate          # bring the tunnel up
 tunnelyard ssh northgate         # ssh through its proxy
 ```
 
-`tunnelyard ssh` with no args lists the defined hosts. It runs `ssh -F ssh/config`, so
-the blocks are self-contained (your `~/.ssh` keys still apply) and nothing leaks
-into your global ssh config. `ssh/config` is gitignored (internal IPs and
-usernames); the committed template is `ssh/config.example`.
+`tunnelyard ssh` with no args lists the defined hosts. It runs `ssh -F` on that
+file, so the blocks are self-contained (your `~/.ssh` keys still apply) and
+nothing leaks into your global ssh config.
 
 **RDP to a Windows host — in a browser, no local client.** A separate container
 renders the remote desktop into a plain browser tab (noVNC) and reaches the host
@@ -315,7 +329,8 @@ use it without a second gateway login. `tunnelyard share` reverse-forwards the p
 to a **jump host you both can reach** — nothing central relays the data beyond
 that host, and the customer gateway isn't touched again.
 
-One-time: copy `share.conf.example` to `share.conf` and set the jump host:
+One-time: copy the repo's `share.conf.example` to `~/.config/tunnelyard/share.conf` and set
+the jump host:
 
 ```
 SHARE_JUMP=you@jump.example.com
@@ -407,6 +422,8 @@ tunnelyard rdp <cust> [host user] # RDP to a Windows host, in a browser
 tunnelyard share <cust>           # share a live tunnel with a teammate
 tunnelyard available              # tunnels teammates are sharing
 tunnelyard join <cust>            # use one of them
+tunnelyard export                 # your config minus personal data, for a colleague
+tunnelyard import <file>          # install a colleague's export (never overwrites)
 tunnelyard selftest               # verify the plumbing without a real VPN
 ```
 
@@ -429,7 +446,7 @@ cannot help, because openconnect drops the field entirely rather than leaving it
 blank.
 
 So the container completes the logon with `curl` instead. `VPN_F5_SCRIPTED=1`
-(already set in `customers/riverside.conf`) runs `f5-login`, which posts
+(already set in the demo `docs/demo-customers/riverside.conf`) runs `f5-login`, which posts
 username + password + `otp=EMAIL`, prompts for the emailed code, and hands the
 resulting authorized session to openconnect to build the tunnel:
 
@@ -489,7 +506,7 @@ Two secrets are needed, and neither is stored in the repo:
 - **Group pre-shared key** — the shared group secret (same for everyone on that
   IKE group). FortiClient keeps it encrypted with a hardcoded key; recovering it
   from the client is non-trivial, so get it from the customer or your own vault.
-  Provide it either as a gitignored file `config/secrets/<name>.psk` (or
+  Provide it either as a file `~/.config/tunnelyard/config/secrets/<name>.psk` (or
   `<group>.psk`), or let the container prompt for it at connect.
 - **XAuth password** — your personal password; always prompted, never stored.
 
