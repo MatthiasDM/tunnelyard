@@ -1,0 +1,33 @@
+# Customer configs carry usernames, gateway hostnames and internal addresses.
+customers/*.conf
+!customers/_template.conf
+
+# VPN profiles, certificates and keys.
+config/*
+!config/.gitkeep
+*.ovpn
+*.pem
+*.key
+*.p12
+
+# IPsec pre-shared keys
+config/secrets/
+*.psk
+
+# SSH host shortcuts (internal IPs / usernames); keep the template
+ssh/config
+!ssh/config.example
+
+
+# local TUI banner (unused)
+banner.txt
+
+# share jump-host config (holds a hostname)
+share.conf
+!share.conf.example
+
+# Per-customer browser profiles (proxy prefs, cookies, session state)
+browser-profiles/
+
+# macOS folder metadata
+.DS_Store

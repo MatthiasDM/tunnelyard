@@ -1,0 +1,43 @@
+# Config for `tunnelyard share` -- exposing a connected tunnel's SOCKS proxy to a
+# teammate through a jump host you both can reach. Copy to share.conf and edit.
+#
+# How it works: `tunnelyard share <customer>` reverse-forwards that customer's local
+# SOCKS proxy up to the jump host; your teammate pulls it back down and points
+# their SOCKS client at it. Nothing central relays the data beyond the jump host
+# you control, and it never touches the customer's gateway again.
+#
+# NOTE: sharing a live session means everything your teammate does is attributed
+# to *your* authenticated session. Be sure you're allowed to share the customer.
+
+# The jump host, as an ssh target reachable by BOTH of you.
+SHARE_JUMP=user@jump.example.com
+
+# How you appear to teammates in their `vpn available` list and TUI. Defaults to
+# your local username. Set it to something recognisable if you like.
+# SHARE_NAME=jdoe
+
+# Directory on the jump host that holds the little manifest files advertising
+# live shares (created automatically). Everyone sharing through the same jump
+# host must use the same value. Default is fine unless it collides with something.
+# SHARE_DIR=vpn-shares
+
+# The ssh command. For Teleport, keep `tsh ssh` (you must be logged in:
+# `tsh login`). For a plain server, set it to `ssh`.
+SHARE_SSH=tsh ssh
+
+# Password-protect each share (default 1). With this on, `tunnelyard share` puts an
+# authenticated SOCKS5 proxy in front and prints a freshly generated password;
+# only the person you give it to can use the share, even if others can reach the
+# jump host. The joiner is prompted for it (or uses socks user/pass in their
+# client). Needs python3. Set to 0 to forward the proxy directly with no
+# password -- only sensible when the jump host itself is locked to exactly the
+# people you intend (see the "account-restricted node" option).
+SHARE_AUTH=1
+
+# Interface on the jump host to bind the forwarded port to. 127.0.0.1 keeps it
+# private to users who can ssh into the jump host (recommended). Use the jump
+# host's LAN/mesh IP only if teammates reach it directly without ssh.
+SHARE_BIND=127.0.0.1
+
+# Port to open on the jump host. Empty = reuse the customer's SOCKS_PORT.
+SHARE_PORT=

@@ -1,0 +1,28 @@
+# SSH shortcuts for customer internal hosts, reached through the per-customer
+# SOCKS proxy. Copy this file to ssh/config and edit.
+#
+#   tunnelyard up <customer>        # bring the tunnel up first
+#   tunnelyard ssh <host-alias>     # then ssh through it
+#
+# The ProxyCommand port is that customer's SOCKS_PORT -- see 'tunnelyard list'. Prefer
+# an internal IP in HostName; internal hostnames also work (ncat resolves them
+# through the proxy), but an IP never depends on DNS.
+#
+# 'tunnelyard ssh' runs 'ssh -F' on this file, so these Host blocks are self-contained
+# and do not touch ~/.ssh/config. Your default keys in ~/.ssh are still used.
+
+Host *
+    ServerAliveInterval 30
+    StrictHostKeyChecking accept-new
+
+# --- Northgate (customer 'northgate', SOCKS 1089) ---
+Host northgate
+    HostName 10.50.0.10                # <-- your server's internal IP or hostname
+    User youruser
+    ProxyCommand ncat --proxy 127.0.0.1:1089 --proxy-type socks5 %h %p
+
+# --- example: a second host on another customer (SOCKS port = its SOCKS_PORT) ---
+# Host westport-app
+#     HostName 10.20.5.40
+#     User youruser
+#     ProxyCommand ncat --proxy 127.0.0.1:1084 --proxy-type socks5 %h %p

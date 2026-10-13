@@ -1,0 +1,1585 @@
+#!/usr/bin/env bash
+# Bring per-customer VPN tunnels up and down as isolated containers.
+set -euo pipefail
+
+# Resolve the script's real location, following symlinks, so `tunnelyard` works when
+# invoked via a symlink on $PATH -- so you can keep a short alias if you like:
+#   ln -s .../bin/tunnelyard ~/.local/bin/ty
+_src="${BASH_SOURCE[0]}"
+while [[ -L "$_src" ]]; do
+    _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+    _src="$(readlink "$_src")"
+    [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+ROOT="$(cd -P "$(dirname "$_src")/.." && pwd)"
+# Overridable so docs, screenshots and demos can point at a throwaway set of
+# configs without touching (or listing) your real customers:
+#   VPN_CUSTOMERS=docs/demo-customers tunnelyard tui
+CUSTOMERS="${VPN_CUSTOMERS:-$ROOT/customers}"
+# Resolved to an absolute path: a relative VPN_CUSTOMERS must survive both the
+# tmux re-exec below and any change of working directory in a spawned pane.
+if [[ -d "$CUSTOMERS" ]]; then CUSTOMERS="$(cd -P "$CUSTOMERS" && pwd)"; fi
+IMAGE="${VPN_IMAGE:-vpn-base:latest}"
+DETACH_KEYS='ctrl-p,ctrl-q'
+
+die() { printf 'tunnelyard: %s\n' "$*" >&2; exit 1; }
+
+# Open a URL in the desktop's default browser. macOS has `open`, most Linux
+# desktops have `xdg-open`; on a headless box neither exists and we just print.
+open_url() {
+    if   command -v open     >/dev/null 2>&1; then open "$1" 2>/dev/null || true
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 || true
+    fi
+}
+
+# Docker Desktop (macOS/Windows) resolves host.docker.internal for free. Native
+# Linux does not, so the container needs it mapped to the host gateway.
+host_gateway_args() {
+    [[ "$(uname -s)" == Linux ]] && printf '%s' "--add-host=host.docker.internal:host-gateway"
+}
+
+# Pull a single KEY=value out of an env file. Last assignment wins; surrounding
+# quotes are stripped. Values must not carry trailing comments.
+read_var() {
+    sed -n "s/^[[:space:]]*$2=//p" "$1" | tail -1 | sed "s/^[\"']//; s/[\"']$//"
+}
+
+envfile_for() {
+    local f="$CUSTOMERS/$1.conf"
+    [[ -f "$f" ]] || die "no config at customers/$1.conf (see 'tunnelyard list')"
+    printf '%s' "$f"
+}
+
+exists() { docker ps -a --format '{{.Names}}' | grep -qx "vpn-$1"; }
+is_up()  { docker ps    --format '{{.Names}}' | grep -qx "vpn-$1"; }
+
+# --- tunnel health ----------------------------------------------------------
+#
+# A running container proves nothing. A gateway that expires the session
+# server-side leaves openconnect holding a transport that is still "connected"
+# -- process alive, tun0 addressed, routes installed -- while every packet sent
+# into it is dropped. Nothing observable from the container's own state
+# distinguishes that from a healthy tunnel, so the only honest check is to send
+# traffic and see whether anything comes back.
+
+HEALTH_TTL="${VPN_HEALTH_TTL:-15}"
+HEALTH_CACHE="${TMPDIR:-/tmp}/vpn-health-$(id -u)"
+
+_health_forget() { rm -f "$HEALTH_CACHE/${1:-}" 2>/dev/null || true; }
+
+_cache_age() {
+    local f="$1" mt
+    mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+    echo $(( $(date +%s) - mt ))
+}
+
+# Where to aim the probe: an explicit HEALTH_PROBE=host:port, else the first
+# FORWARDS entry (lport:host:rport) -- by definition a host this tunnel exists
+# to reach.
+_probe_target() {
+    local f="$1" p fwd first rest
+    p="$(read_var "$f" HEALTH_PROBE)"
+    if [[ -z "$p" ]]; then
+        fwd="$(read_var "$f" FORWARDS)"
+        if [[ -n "$fwd" ]]; then
+            first="${fwd%%,*}"
+            rest="${first#*:}"
+            [[ "$rest" != "$first" ]] && p="$rest"
+        fi
+    fi
+    printf '%s' "$p"
+}
+
+# Runs inside the container. Emits exactly one word.
+#
+# A successful connect proves the path. A *failed* connect still proves it if
+# the interface's rx counter moved, because that means the peer answered (a
+# refused port sends back an RST) -- reachability is the question, not whether
+# the service is listening. Only silence, with the counter frozen, is a dead
+# tunnel.
+read -r -d '' _HEALTH_SH <<'EOSH' || true
+iface=$(ip -4 -br addr 2>/dev/null | grep -viE '^(lo|eth0)' | head -1 | cut -d' ' -f1)
+[ -n "$iface" ] || { echo connecting; exit 0; }
+addr=$(ip -4 -br addr show "$iface" 2>/dev/null | tr -s ' ' | cut -d' ' -f3)
+[ -n "$addr" ] || { echo connecting; exit 0; }
+[ -n "${PROBE:-}" ] || { echo unverified; exit 0; }
+
+h=${PROBE%:*}; p=${PROBE##*:}
+rxf=/sys/class/net/$iface/statistics/rx_bytes
+before=$(cat "$rxf" 2>/dev/null || echo 0)
+if socat -T5 /dev/null "TCP:$h:$p,connect-timeout=5" >/dev/null 2>&1; then
+    echo up; exit 0
+fi
+after=$(cat "$rxf" 2>/dev/null || echo 0)
+if [ "$after" -gt "$before" ]; then echo up; else echo stale; fi
+EOSH
+
+# _health <customer> [fresh] -> down|stopped|connecting|up|stale|unverified
+_health() {
+    local name="${1:-}" fresh="${2:-}" cf state probe="" envfile
+    exists "$name" || { echo down; return; }
+    is_up  "$name" || { echo stopped; return; }
+
+    mkdir -p "$HEALTH_CACHE" 2>/dev/null && chmod 700 "$HEALTH_CACHE" 2>/dev/null || true
+    cf="$HEALTH_CACHE/$name"
+    if [[ -z "$fresh" && -f "$cf" ]] && (( $(_cache_age "$cf") < HEALTH_TTL )); then
+        cat "$cf"; return
+    fi
+
+    envfile="$CUSTOMERS/$name.conf"
+    [[ -f "$envfile" ]] && probe="$(_probe_target "$envfile")"
+
+    state="$(docker exec -e "PROBE=$probe" "vpn-$name" sh -c "$_HEALTH_SH" 2>/dev/null || true)"
+    case "$state" in
+        up|stale|connecting|unverified) : ;;
+        *) state=unverified ;;
+    esac
+    printf '%s' "$state" > "$cf" 2>/dev/null || true
+    printf '%s' "$state"
+}
+
+# Refresh every running tunnel's health at once, so a caller that renders a
+# whole table pays one probe timeout rather than one per customer.
+_health_warm() {
+    local n
+    for n in $(docker ps --format '{{.Names}}' | grep '^vpn-' || true); do
+        _health "${n#vpn-}" >/dev/null 2>&1 &
+    done
+    wait
+}
+
+# Human-readable state, optionally coloured: $2 green, $3 yellow, $4 red, $5
+# reset. Called with no colours for plain output.
+_health_label() {
+    case "$1" in
+        up)         printf '%sup%s'                     "${2:-}" "${5:-}" ;;
+        stale)      printf '%sSTALE (no return traffic)%s' "${4:-}" "${5:-}" ;;
+        connecting) printf '%sconnecting%s'             "${3:-}" "${5:-}" ;;
+        unverified) printf '%sup (unverified)%s'        "${3:-}" "${5:-}" ;;
+        stopped)    printf '%sstopped%s'                "${3:-}" "${5:-}" ;;
+        *)          printf 'down' ;;
+    esac
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_build() {
+    docker build -t "$IMAGE" "$ROOT"
+}
+
+# The Debian base a given image tag is built from -- so a missing image can be
+# rebuilt on demand with the right openconnect version. A customer may override
+# it with VPN_IMAGE_BASE; otherwise known tags map here, and anything unknown
+# falls back to the Dockerfile's own default base.
+_image_base() {
+    local image="$1" envfile="${2:-}" b=""
+    [[ -n "$envfile" ]] && b="$(read_var "$envfile" VPN_IMAGE_BASE)"
+    if [[ -z "$b" ]]; then
+        case "$image" in
+            vpn-base-next:*) b="debian:sid" ;;         # openconnect 9.21: Ivanti/Pulse + GP
+            *)               b="" ;;                    # let the Dockerfile default stand
+        esac
+    fi
+    printf '%s' "$b"
+}
+
+# Make sure a customer's image exists, building it on demand from the right base.
+# The default image builds via cmd_build (Dockerfile default); a pinned image
+# (e.g. vpn-base-next) builds with its mapped/overridden BASE. Progress goes to
+# stderr so it shows in the TUI's side pane.
+_ensure_image() {
+    local image="$1" envfile="${2:-}"
+    docker image inspect "$image" >/dev/null 2>&1 && return 0
+    if [[ "$image" == "$IMAGE" ]]; then
+        echo "tunnelyard: image '$image' not found -- building it (first time, a few minutes)..." >&2
+        cmd_build >&2 || die "build of '$image' failed"
+        return 0
+    fi
+    local base; base="$(_image_base "$image" "$envfile")"
+    echo "tunnelyard: image '$image' not found -- building it${base:+ from $base} (first time, a few minutes)..." >&2
+    if [[ -n "$base" ]]; then
+        docker build --build-arg BASE="$base" -t "$image" "$ROOT" >&2 || die "build of '$image' failed"
+    else
+        docker build -t "$image" "$ROOT" >&2 || die "build of '$image' failed"
+    fi
+}
+
+# True if something on the host is already listening on the given TCP port.
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; return 1; }
+
+# Read one field of a 1Password item. Handles both an op:// secret reference
+# (op://vault/item) via `op read`, and a plain item name/UUID via `op item get`.
+# field is username|password|otp.
+_op_field() {
+    local item="$1" field="$2"
+    if [[ "$item" == op://* ]]; then
+        local base="${item%/}"
+        if [[ "$field" == otp ]]; then op read "$base/one-time password?attribute=otp" 2>/dev/null
+        else op read "$base/$field" 2>/dev/null; fi
+    else
+        if [[ "$field" == otp ]]; then op item get "$item" --otp 2>/dev/null
+        else op item get "$item" --fields "label=$field" --reveal 2>/dev/null; fi
+    fi
+}
+
+cmd_up() {
+    local name="" bg=0 a
+    for a in "$@"; do
+        case "$a" in --bg) bg=1 ;; *) name="$a" ;; esac
+    done
+    [[ -n "$name" ]] || die "usage: tunnelyard up <customer> [--bg]"
+    local envfile; envfile="$(envfile_for "$name")"
+
+    # A customer can pin a different image (e.g. vpn-base-next for openconnect
+    # 9.21) via VPN_IMAGE. Either way, build it on demand if it's missing -- these
+    # images live only in the local Docker store, so a prune or a fresh machine
+    # loses them, and the connect should just rebuild rather than erroring out.
+    local image; image="$(read_var "$envfile" VPN_IMAGE)"; [[ -n "$image" ]] || image="$IMAGE"
+    _ensure_image "$image" "$envfile"
+
+    # A previous attempt that exited leaves a stopped container behind; clear it
+    # rather than making the user run 'tunnelyard down' after every failed login.
+    if exists "$name" && ! is_up "$name"; then
+        docker rm -f "vpn-$name" >/dev/null
+    fi
+    is_up "$name" && die "vpn-$name is already running -- 'tunnelyard down $name' first"
+    _health_forget "$name"
+
+    [[ "$(read_var "$envfile" VPN_STATUS)" == "pending" ]] && \
+        die "vpn-$name is marked pending in customers/$name.conf (not runnable yet -- see that file)"
+
+    local socks forwards
+    socks="$(read_var "$envfile" SOCKS_PORT)"
+    forwards="$(read_var "$envfile" FORWARDS)"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+
+    local args=(
+        -it --detach-keys="$DETACH_KEYS"
+        --name "vpn-$name"
+        --cap-add=NET_ADMIN
+        --device /dev/net/tun
+        --env-file "$envfile"
+        -e "VPN_NAME=$name"
+        -p "127.0.0.1:$socks:1080"
+    )
+
+    # Profiles and certs (openvpn / wireguard / client-cert auth) live here.
+    [[ -d "$ROOT/config" ]] && args+=(-v "$ROOT/config:/config:ro")
+
+    # Preflight every host port so a clash gives a clear message, not docker's.
+    port_in_use "$socks" && die "host port $socks (SOCKS_PORT) is already in use -- pick another in customers/$name.conf"
+    if [[ -n "$forwards" ]]; then
+        local saved_ifs="$IFS" fwd lport
+        IFS=','
+        for fwd in $forwards; do
+            IFS="$saved_ifs"
+            [[ -n "$fwd" ]] || continue
+            lport="${fwd%%:*}"
+            port_in_use "$lport" && die "host port $lport (a FORWARDS entry) is already in use -- change its left-hand port in customers/$name.conf"
+            args+=(-p "127.0.0.1:$lport:$lport")
+            IFS=','
+        done
+        IFS="$saved_ifs"
+    fi
+
+    # 1Password: fetch credentials on the host (Touch ID) and auto-fill them at
+    # the client's prompts via the PTY wrapper. They never enter the container's
+    # environment or `docker inspect`. Needs the op CLI integration enabled.
+    local op_item op_pass="" op_otp=""
+    op_item="$(read_var "$envfile" OP_ITEM)"
+    if [[ -n "$op_item" ]]; then
+        command -v op >/dev/null 2>&1 || die "OP_ITEM is set but the 1Password CLI 'op' is not installed"
+        command -v python3 >/dev/null 2>&1 || die "OP_ITEM needs python3 (for credential auto-fill)"
+        printf 'fetching credentials from 1Password (%s)...\n' "$op_item" >&2
+        op_pass="$(_op_field "$op_item" password)" \
+            || die "1Password: could not read '$op_item' -- is the op app integration enabled and unlocked?"
+        [[ -n "$op_pass" ]] || die "1Password: empty password for '$op_item'"
+        local op_user; op_user="$(read_var "$envfile" VPN_USER)"
+        [[ -n "$op_user" ]] || op_user="$(_op_field "$op_item" username || true)"
+        [[ -n "$op_user" ]] && args+=(-e "VPN_USER=$op_user")
+        [[ "$(read_var "$envfile" OP_OTP)" == "1" ]] && op_otp="$(_op_field "$op_item" otp || true)"
+    fi
+
+    if [[ -n "$op_item" ]]; then
+        printf 'vpn-%s connecting with 1Password credentials; backgrounds itself once connected.\n\n' "$name"
+    elif [[ $bg -eq 1 ]]; then
+        printf 'vpn-%s starting. Enter password / MFA below; it backgrounds itself once connected.\n\n' "$name"
+    else
+        cat <<EOF
+vpn-$name starting. Answer any password / MFA prompts below.
+Once connected, press ctrl-p ctrl-q to detach -- the tunnel keeps running.
+
+EOF
+    fi
+
+    # Foreground and interactive so the terminal is attached before the login
+    # script prompts. The PTY wrapper auto-detaches on the "connected" marker
+    # (and, in 1Password mode, types the password/OTP at the prompts).
+    local marker='Configured as|Initialization Sequence Completed|wireguard up|IPsec established'
+    if [[ -n "$op_item" ]]; then
+        OP_PASSWORD="$op_pass" OP_OTP="$op_otp" \
+            python3 "$ROOT/libexec/autodetach.py" "$marker" \
+            docker run "${args[@]}" "$image" || true
+    elif [[ $bg -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+        python3 "$ROOT/libexec/autodetach.py" "$marker" \
+            docker run "${args[@]}" "$image" || true
+    else
+        docker run "${args[@]}" "$image" || true
+    fi
+
+    if is_up "$name"; then
+        printf '\nsocks5://127.0.0.1:%s\n' "$socks"
+    else
+        printf '\nvpn-%s stopped. See: tunnelyard logs %s\n' "$name" "$name" >&2
+        return 1
+    fi
+}
+
+cmd_down() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard down <customer>|--all"
+
+    if [[ "$name" == "--all" ]]; then
+        # Tunnels, their RDP sessions, and any shares together.
+        cmd_unshare --all >/dev/null 2>&1 || true
+        local ids
+        ids="$(docker ps -aq --filter 'name=^vpn-' --filter 'name=^rdp-' || true)"
+        if [[ -n "$ids" ]]; then
+            # shellcheck disable=SC2086
+            docker rm -f $ids >/dev/null
+        fi
+        rm -rf "$HEALTH_CACHE" 2>/dev/null || true
+        echo "all tunnels down"
+        return
+    fi
+
+    exists "$name" || die "vpn-$name does not exist"
+    docker rm -f "vpn-$name" >/dev/null
+    _health_forget "$name"
+    # An RDP session and a share both ride this tunnel's proxy, so stop them too.
+    docker rm -f "rdp-$name" >/dev/null 2>&1 && echo "rdp-$name down"
+    _share_active "$name" && { cmd_unshare "$name" >/dev/null 2>&1 || true; echo "share stopped"; }
+    echo "vpn-$name down"
+}
+
+cmd_status() {
+    # 26 = the widest label ("STALE (no return traffic)") plus a space. When
+    # colouring, printf pads by bytes, so widen by the 9 bytes the escape codes
+    # add to keep the ENDPOINTS column aligned.
+    local GRN='' YEL='' RED='' RST='' pad=26
+    if [[ -t 1 || "${VPN_FORCE_COLOR:-0}" == 1 ]]; then
+        GRN=$'\033[32m'; YEL=$'\033[33m'; RED=$'\033[31m'; RST=$'\033[0m'
+        pad=35
+    fi
+    printf '%-14s %-26s %s\n' CUSTOMER STATE ENDPOINTS
+    _health_warm
+    docker ps -a --filter 'name=^vpn-' \
+        --format '{{.Names}}\t{{.Ports}}' \
+    | while IFS=$'\t' read -r n p; do
+        local c="${n#vpn-}" st
+        st="$(_health "$c")"
+        printf "%-14s %-${pad}s %s\n" \
+            "$c" "$(_health_label "$st" "$GRN" "$YEL" "$RED" "$RST")" "${p:--}"
+    done
+}
+
+cmd_list() {
+    printf '%-14s %-8s %-12s %s\n' CUSTOMER SOCKS PROTOCOL SERVER
+    local f b proto tag
+    for f in "$CUSTOMERS"/*.conf; do
+        [[ -e "$f" ]] || continue
+        b="$(basename "$f" .conf)"
+        [[ "$b" == _* ]] && continue
+        # Show VPN_PROTOCOL where it applies, otherwise the kind (openvpn,
+        # wireguard, strongswan). Flag pending configs.
+        proto="$(read_var "$f" VPN_PROTOCOL)"
+        [[ -n "$proto" ]] || proto="$(read_var "$f" VPN_KIND)"
+        [[ "$(read_var "$f" VPN_STATUS)" == "pending" ]] && proto="$proto*"
+        printf '%-14s %-8s %-12s %s\n' \
+            "$b" \
+            "$(read_var "$f" SOCKS_PORT)" \
+            "$proto" \
+            "$(read_var "$f" VPN_SERVER)"
+    done
+}
+
+# Fetch the logon page and list its form fields. Unauthenticated -- no
+# credentials are sent, so this is safe to run and to paste around. Use it to
+# find fields the client is failing to fill in.
+cmd_probe() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard probe <customer>"
+    local envfile; envfile="$(envfile_for "$name")"
+    local server; server="$(read_var "$envfile" VPN_SERVER)"
+    [[ -n "$server" ]] || die "VPN_SERVER not set in customers/$name.conf"
+    [[ "$server" == http://* || "$server" == https://* ]] || server="https://$server"
+
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
+
+    printf 'GET %s (unauthenticated)\n\n' "$server"
+    docker run --rm -e "PROBE_URL=$server" --entrypoint sh "$IMAGE" -c '
+        curl -skL --max-time 20 -c /tmp/jar -b /tmp/jar \
+             -o /tmp/page -w "http %{http_code}, %{size_download} bytes, final url %{url_effective}\n" \
+             "$PROBE_URL" || { echo "request failed"; exit 1; }
+        echo
+        fields=$(sed "s/</\n</g" /tmp/page \
+                 | grep -iE "^<(form|input|select|option)" \
+                 | sed "s/[[:space:]]\+/ /g")
+        if [ -n "$fields" ]; then
+            echo "$fields"
+        else
+            echo "no form fields found -- the logon page is probably rendered by"
+            echo "javascript. Fall back to viewing source in the browser."
+        fi
+    '
+}
+
+# Run the logon exchange only. Tells you whether the gateway grants a session
+# at all, which is the question when a policy has an endpoint-inspection stage.
+cmd_auth() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard auth <customer>"
+    local envfile; envfile="$(envfile_for "$name")"
+
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
+
+    local args=(
+        --rm -it
+        --cap-add=NET_ADMIN
+        --device /dev/net/tun
+        --env-file "$envfile"
+        -e "VPN_NAME=$name"
+        -e VPN_AUTH_ONLY=1
+    )
+    [[ -d "$ROOT/config" ]] && args+=(-v "$ROOT/config:/config:ro")
+
+    docker run "${args[@]}" "$IMAGE"
+}
+
+cmd_attach() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard attach <customer>"
+    docker attach --detach-keys="$DETACH_KEYS" "vpn-$name"
+}
+
+cmd_shell() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard shell <customer>"
+    docker exec -it "vpn-$name" bash
+}
+
+cmd_logs() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard logs <customer>"
+    shift
+    docker logs "$@" "vpn-$name"
+}
+
+# ssh to a customer's internal host through its SOCKS proxy, using the repo's
+# ssh/config so the shortcuts live here, not in ~/.ssh/config.
+cmd_ssh() {
+    local cfg="$ROOT/ssh/config"
+    if [[ ! -f "$cfg" ]]; then
+        die "no ssh/config yet -- copy ssh/config.example to ssh/config and add your hosts"
+    fi
+    if [[ $# -eq 0 ]]; then
+        echo "defined hosts (ssh/config):"
+        grep -iE '^[[:space:]]*Host[[:space:]]' "$cfg" | awk '{for(i=2;i<=NF;i++) if($i!="*") print "  "$i}'
+        echo
+        echo "usage: tunnelyard ssh <host> [ssh args...]   (bring the tunnel up first: tunnelyard up <customer>)"
+        return 0
+    fi
+    exec ssh -F "$cfg" "$@"
+}
+
+# Custom per-customer commands live in the config as CMD_<label>=<command>.
+# They run inside the tunnel container's network namespace, so they reach the
+# customer network directly -- a raw `ssh user@10.x.x.x` just works, no proxy.
+_cmd_labels() {  # arg: envfile
+    grep -oE '^CMD_[A-Za-z0-9_-]+=' "$1" 2>/dev/null | sed 's/^CMD_//; s/=$//'
+}
+
+_run_in_tunnel() {  # args: name, command-string
+    local name="$1" cmd="$2"
+    is_up "$name" || { echo "vpn-$name is not up -- 'tunnelyard up $name' first."; return 1; }
+
+    # "@host <cmd>" runs on your Mac instead of inside the container. For the
+    # things a container cannot do because it has no desktop -- chiefly opening a
+    # URL in a browser pointed at this tunnel's SOCKS proxy. The tunnel still has
+    # to be up (checked above), because such a command goes through that proxy.
+    if [[ "$cmd" == "@host "* ]]; then
+        local hcmd="${cmd#@host }"
+        # Exported so a CMD_ entry can say "$ROOT"/libexec/... instead of
+        # hard-coding an absolute path that breaks if the repo moves.
+        export ROOT
+        echo "+ (host) $hcmd"; echo
+        sh -c "$hcmd"
+        return
+    fi
+    # Warn if the running container predates the current image (e.g. a tool like
+    # ssh was added since it started) -- otherwise the command hits "not found".
+    local envfile want have
+    envfile="$(envfile_for "$name")"
+    want="$(read_var "$envfile" VPN_IMAGE)"; [[ -n "$want" ]] || want="$IMAGE"
+    want="$(docker image inspect "$want" --format '{{.Id}}' 2>/dev/null || true)"
+    have="$(docker inspect "vpn-$name" --format '{{.Image}}' 2>/dev/null || true)"
+    [[ -n "$want" && -n "$have" && "$want" != "$have" ]] && \
+        echo "note: vpn-$name runs an older image -- 'tunnelyard restart $name' to pick up newer tools" >&2
+    echo "+ $cmd"; echo
+    docker exec -it "vpn-$name" sh -c "$cmd"
+}
+
+cmd_run() {
+    local name="${1:-}" label="${2:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard run <customer> [label]"
+    local envfile; envfile="$(envfile_for "$name")"
+    if [[ -z "$label" ]]; then
+        echo "commands for $name (tunnelyard run $name <label>):"
+        _cmd_labels "$envfile" | sed 's/^/  /'
+        return 0
+    fi
+    local cmd; cmd="$(read_var "$envfile" "CMD_$label")"
+    [[ -n "$cmd" ]] || die "no command '$label' in customers/$name.conf (see 'tunnelyard run $name')"
+    _run_in_tunnel "$name" "$cmd"
+}
+
+# TUI: pick a stored command (or add one), then run it in the tunnel. Runs in a
+# side pane via __tui-spawn.
+_tui_run() {
+    local name="${1:-}"; [[ -n "$name" ]] || return 0
+    local envfile; envfile="$(envfile_for "$name")"
+    local labels choice label cmd
+    labels="$(_cmd_labels "$envfile")"
+    choice="$(printf '%s\n%s\n' "$labels" '[+ add new command]' | grep -v '^[[:space:]]*$' \
+              | fzf --prompt="$name cmd> " --height 45% --header 'Enter: run · add a new one below')" || return 0
+    if [[ "$choice" == '[+ add new command]' ]]; then
+        printf 'label (letters/digits/-_, no spaces): '; read -r label
+        [[ "$label" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid label"; sleep 2; return 0; }
+        printf 'command (runs inside vpn-%s; prefix "@host " to run on your Mac): ' "$name"; read -r cmd
+        [[ -n "$cmd" ]] || return 0
+        printf 'CMD_%s=%s\n' "$label" "$cmd" >> "$envfile"
+        echo "saved CMD_$label to customers/$name.conf"
+        choice="$label"
+    fi
+    cmd="$(read_var "$envfile" "CMD_$choice")"
+    [[ -n "$cmd" ]] || return 0
+    _run_in_tunnel "$name" "$cmd" || true
+    printf '\n[done -- press ENTER to close] '; read -r _
+}
+
+# End-to-end check of the container plumbing without touching a real VPN.
+cmd_selftest() {
+    cmd_build
+    docker rm -f vpn-selftest >/dev/null 2>&1 || true
+
+    docker run -d -it --name vpn-selftest \
+        --cap-add=NET_ADMIN --device /dev/net/tun \
+        -e VPN_NAME=selftest -e VPN_KIND=selftest \
+        -e FORWARDS='2575:example.com:80' \
+        -p 127.0.0.1:11080:1080 \
+        -p 127.0.0.1:2575:2575 \
+        "$IMAGE" >/dev/null
+
+    local rc=0
+    sleep 2
+
+    echo
+    echo "--- container log ---"
+    docker logs vpn-selftest
+
+    echo
+    echo "--- host checks ---"
+    if curl -fsS --max-time 15 --socks5-hostname 127.0.0.1:11080 \
+            -o /dev/null -w 'socks5 proxy      : HTTP %{http_code} via 127.0.0.1:11080\n' \
+            https://example.com; then :; else
+        echo "socks5 proxy      : FAILED"; rc=1
+    fi
+
+    if curl -fsS --max-time 15 -H 'Host: example.com' \
+            -o /dev/null -w 'tcp forward       : HTTP %{http_code} via 127.0.0.1:2575\n' \
+            http://127.0.0.1:2575/; then :; else
+        echo "tcp forward       : FAILED"; rc=1
+    fi
+
+    if docker exec vpn-selftest test -c /dev/net/tun; then
+        echo "tun device        : present"
+    else
+        echo "tun device        : MISSING"; rc=1
+    fi
+
+    docker rm -f vpn-selftest >/dev/null
+    echo
+    [[ $rc -eq 0 ]] && echo "selftest passed" || echo "selftest FAILED"
+    return $rc
+}
+
+RDP_IMAGE="${VPN_RDP_IMAGE:-vpn-rdp:latest}"
+
+# Open a browser-based RDP session to an internal Windows host, routed through a
+# customer tunnel's SOCKS proxy. No local RDP client needed -- just a browser.
+cmd_rdp() {
+    local name="${1:-}" server="${2:-}" userarg="${3:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard rdp <customer> [server-ip] [DOMAIN\\\\user]"
+    local envfile; envfile="$(envfile_for "$name")"
+
+    # Fall back to the customer config so `tunnelyard rdp <customer>` (and the TUI) work
+    # with no args once RDP_SERVER / RDP_USER are set there.
+    [[ -n "$server" ]]  || server="$(read_var "$envfile" RDP_SERVER)"
+    [[ -n "$server" ]]  || die "no RDP server -- pass one, or set RDP_SERVER in customers/$name.conf"
+    [[ -n "$userarg" ]] || userarg="$(read_var "$envfile" RDP_USER)"
+
+    is_up "$name" || die "vpn-$name is not up -- 'tunnelyard up $name' first (RDP rides its tunnel)"
+
+    local socks; socks="$(read_var "$envfile" SOCKS_PORT)"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+    local web=$(( socks + 5000 ))     # 1083 -> 6083, stable per customer
+    local geo; geo="$(read_var "$envfile" RDP_GEOMETRY)"
+
+    docker image inspect "$RDP_IMAGE" >/dev/null 2>&1 || \
+        docker build -t "$RDP_IMAGE" -f "$ROOT/Dockerfile.rdp" "$ROOT"
+
+    # Credentials: split an optional DOMAIN\user, prompt for the rest. The
+    # password goes in on stdin, never into the container's environment.
+    local rdomain="" ruser="$userarg"
+    if [[ "$ruser" == *\\* ]]; then rdomain="${ruser%%\\*}"; ruser="${ruser#*\\}"; fi
+    [[ -n "$ruser" ]] || { printf 'RDP username: ' >&2; read -r ruser; }
+    if [[ -z "$rdomain" && "$ruser" == *\\* ]]; then rdomain="${ruser%%\\*}"; ruser="${ruser#*\\}"; fi
+    local rpass; printf 'RDP password for %s: ' "${rdomain:+$rdomain\\}$ruser" >&2
+    read -rs rpass; printf '\n' >&2
+
+    port_in_use "$web" && die "host port $web is already in use -- stop the other user or 'tunnelyard rdp-stop $name'"
+    docker rm -f "rdp-$name" >/dev/null 2>&1 || true
+
+    docker run -d --name "rdp-$name" \
+        -p "127.0.0.1:$web:$web" \
+        -e RDP_SERVER="$server" \
+        $(host_gateway_args) \
+        -e RDP_SOCKS="host.docker.internal:$socks" \
+        -e RDP_WEB="$web" \
+        -e RDP_USER="$ruser" \
+        -e RDP_DOMAIN="$rdomain" \
+        -e RDP_PASS="$rpass" \
+        ${geo:+-e RDP_GEOMETRY="$geo"} \
+        "$RDP_IMAGE" >/dev/null
+
+    local url="http://127.0.0.1:$web/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+    echo
+    echo "RDP session for $name -> $server starting."
+    echo "Open:  $url"
+    open_url "$url"
+    echo "Logs:  tunnelyard rdp-logs $name    Stop: tunnelyard rdp-stop $name"
+}
+
+cmd_rdp_logs() {
+    local name="${1:-}"; [[ -n "$name" ]] || die "usage: tunnelyard rdp-logs <customer>"
+    shift; docker logs "$@" "rdp-$name"
+}
+
+cmd_rdp_stop() {
+    local name="${1:-}"
+    if [[ "$name" == "--all" || -z "$name" ]]; then
+        local ids; ids="$(docker ps -aq --filter 'name=^rdp-' || true)"
+        [[ -n "$ids" ]] && docker rm -f $ids >/dev/null   # shellcheck disable=SC2086
+        echo "all rdp sessions stopped"; return
+    fi
+    docker rm -f "rdp-$name" >/dev/null 2>&1 && echo "rdp-$name stopped" || die "no rdp session for $name"
+}
+
+# --- sharing a tunnel with a teammate via a jump host ------------------------
+#
+# `tunnelyard share <customer>` reverse-forwards the customer's local SOCKS proxy up to
+# a jump host both people can reach (see share.conf). The teammate pulls it back
+# down and uses it as their SOCKS proxy. Nothing re-touches the customer gateway.
+
+SHARE_RUN="${TMPDIR:-/tmp}/vpn-share-$(id -u)"    # tunnels *I* am offering
+JOIN_RUN="${TMPDIR:-/tmp}/vpn-join-$(id -u)"      # teammates' shares *I* have joined
+
+_share_conf() {  # arg: KEY -> value from the gitignored share.conf, or empty
+    local f="$ROOT/share.conf"
+    # Must succeed even when share.conf is absent: callers do
+    # `x="$(_share_conf KEY)"`, and under `set -e` a non-zero return here would
+    # kill the process at that assignment -- before the explicit "no SHARE_JUMP,
+    # copy share.conf.example" die that is supposed to explain what to do.
+    [[ -f "$f" ]] || return 0
+    read_var "$f" "$1"
+}
+
+_share_active() {  # arg: customer -> true if its forward process is alive
+    local pf="$SHARE_RUN/$1.pid" pid
+    [[ -f "$pf" ]] || return 1
+    pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+_join_active() {  # arg: customer -> true if my forward to a teammate's share is alive
+    local pf="$JOIN_RUN/$1.pid" pid
+    [[ -f "$pf" ]] || return 1
+    pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Who I advertise shares as, and the directory on the jump host that holds the
+# little manifest files. Both overridable in share.conf.
+_share_owner() { local n; n="$(_share_conf SHARE_NAME)"; [[ -n "$n" ]] || n="$(id -un 2>/dev/null || whoami)"; printf '%s' "$n"; }
+_share_dir()   { local d; d="$(_share_conf SHARE_DIR)";  [[ -n "$d" ]] || d="vpn-shares"; printf '%s' "$d"; }
+
+# A strong URL-safe password (no +/=/ so it's safe inside a socks5h:// URL).
+_gen_pass() { python3 -c 'import secrets;print(secrets.token_urlsafe(16))'; }
+
+# First free loopback port at or after $1 -- where the auth proxy listens.
+_free_local_port() { local p="${1:-21000}"; while port_in_use "$p"; do p=$((p + 1)); done; printf '%s' "$p"; }
+
+_pidfile_alive() {
+    local pf="$1" pid
+    [[ -f "$pf" ]] || return 1
+    pid="$(cat "$pf" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Stop the auth proxy fronting a share and forget its secret.
+_share_stop_proxy() {
+    local name="$1" pf="$SHARE_RUN/$1.proxy.pid"
+    [[ -f "$pf" ]] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$pf" "$SHARE_RUN/$name.proxy.log" "$SHARE_RUN/$name.pass"
+}
+
+# Pull one field out of a  k=v;k=v  manifest line.
+_kv() { printf '%s' "$1" | tr ';' '\n' | sed -n "s/^$2=//p" | head -1; }
+
+# List the manifest lines advertised on the jump host (one share per line).
+# Best-effort: prints nothing and fails quietly if the host is unreachable.
+_available_fetch() {
+    local jump sshcmd dir
+    jump="$(_share_conf SHARE_JUMP)"; [[ -n "$jump" ]] || return 1
+    sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
+    dir="$(_share_dir)"
+    # The trailing `|| true` is inside the REMOTE command on purpose: an empty
+    # share dir makes `cat *.share` exit non-zero (the glob matches nothing), and
+    # without this the caller would misread "no shares" as "host unreachable" --
+    # and the TUI's cache refresh would fail and keep showing stale rows. A truly
+    # unreachable host still fails ssh itself, so this stays non-zero for that.
+    # shellcheck disable=SC2086
+    $sshcmd "$jump" "cat ~/$dir/*.share 2>/dev/null || true" 2>/dev/null
+}
+
+# Advertise a live share by dropping a manifest on the jump host, so a teammate's
+# TUI can discover and one-click-join it. Best-effort and backgrounded -- the
+# reverse-forward is the real product; the manifest is just a signpost.
+_share_manifest_put() {
+    local name="$1" pport="$2" socks="$3" jump="$4" sshcmd="$5" auth="${6:-1}" user="${7:-share}"
+    local owner dir host ts
+    owner="$(_share_owner)"; dir="$(_share_dir)"
+    host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo mac)"
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
+    # The manifest advertises whether a password is required and the socks user,
+    # but never the password itself -- anyone who can read the jump host's share
+    # dir could see it, which would defeat the point. The sharer hands the
+    # password to the one person out of band.
+    # shellcheck disable=SC2086
+    printf 'customer=%s;port=%s;socks=%s;owner=%s;host=%s;auth=%s;user=%s;ts=%s\n' \
+        "$name" "$pport" "$socks" "$owner" "$host" "$auth" "$user" "$ts" \
+        | $sshcmd "$jump" "mkdir -p ~/$dir && cat > ~/$dir/${owner}__${name}.share" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# Remove my manifest for a customer (on unshare / tunnel-down). Backgrounded.
+_share_manifest_rm() {
+    local name="$1" owner dir jump sshcmd
+    jump="$(_share_conf SHARE_JUMP)"; [[ -n "$jump" ]] || return 0
+    sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
+    owner="$(_share_owner)"; dir="$(_share_dir)"
+    # shellcheck disable=SC2086
+    $sshcmd "$jump" "rm -f ~/$dir/${owner}__${name}.share" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+cmd_share() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard share <customer>"
+    local envfile; envfile="$(envfile_for "$name")"
+    is_up "$name" || die "vpn-$name is not up -- 'tunnelyard up $name' first"
+    _share_active "$name" && die "vpn-$name is already shared -- 'tunnelyard unshare $name' first"
+
+    local jump sshcmd bind socks pport auth
+    jump="$(_share_conf SHARE_JUMP)"
+    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf and set the jump host"
+    sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
+    bind="$(_share_conf SHARE_BIND)"; [[ -n "$bind" ]] || bind="127.0.0.1"
+    socks="$(read_var "$envfile" SOCKS_PORT)"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+    pport="$(_share_conf SHARE_PORT)"; [[ -n "$pport" ]] || pport="$socks"
+    auth="$(_share_conf SHARE_AUTH)"; [[ -n "$auth" ]] || auth=1   # password-protect by default
+
+    mkdir -p "$SHARE_RUN" && chmod 700 "$SHARE_RUN"
+    local log="$SHARE_RUN/$name.log"
+
+    # What the reverse-forward points at on this Mac. With auth on (the default),
+    # that's a local authenticated SOCKS5 front-end (libexec/authproxy.py) that
+    # chains to the tunnel's own proxy: only someone holding the generated
+    # password can use the forward, even if others can reach the jump host it
+    # lands on. SHARE_AUTH=0 forwards the tunnel's proxy directly (no password).
+    local target="$socks" pass="" user="share"
+    if [[ "$auth" != 0 ]]; then
+        command -v python3 >/dev/null 2>&1 || die "password-protected sharing needs python3 (or set SHARE_AUTH=0 in share.conf)"
+        local aport; aport="$(_free_local_port $((socks + 10000)))"
+        pass="$(_gen_pass)"
+        SHARE_PROXY_PASS="$pass" nohup python3 "$ROOT/libexec/authproxy.py" \
+            --listen "127.0.0.1:$aport" --upstream "127.0.0.1:$socks" --user "$user" \
+            </dev/null >"$SHARE_RUN/$name.proxy.log" 2>&1 &
+        echo $! > "$SHARE_RUN/$name.proxy.pid"
+        disown 2>/dev/null || true
+        sleep 1
+        if ! _pidfile_alive "$SHARE_RUN/$name.proxy.pid"; then
+            echo "share failed: the auth proxy did not start -- see $SHARE_RUN/$name.proxy.log" >&2
+            tail -4 "$SHARE_RUN/$name.proxy.log" 2>/dev/null >&2 || true
+            rm -f "$SHARE_RUN/$name.proxy.pid"
+            return 1
+        fi
+        printf '%s' "$pass" > "$SHARE_RUN/$name.pass"; chmod 600 "$SHARE_RUN/$name.pass"
+        target="$aport"
+    fi
+
+    # Reverse-forward: jump-host <bind>:<pport> -> this Mac's 127.0.0.1:<target>.
+    # shellcheck disable=SC2086
+    nohup $sshcmd -N -R "$bind:$pport:127.0.0.1:$target" "$jump" </dev/null >"$log" 2>&1 &
+    echo $! > "$SHARE_RUN/$name.pid"
+    disown 2>/dev/null || true
+
+    sleep 1
+    if ! _share_active "$name"; then
+        printf 'share failed to start -- is your session valid (tsh login)? See %s\n' "$log" >&2
+        tail -4 "$log" 2>/dev/null >&2 || true
+        rm -f "$SHARE_RUN/$name.pid"
+        _share_stop_proxy "$name"
+        return 1
+    fi
+
+    # Advertise it (auth flag + socks user, never the password) so a teammate's
+    # TUI can discover and join it.
+    _share_manifest_put "$name" "$pport" "$socks" "$jump" "$sshcmd" "$auth" "$user"
+
+    if [[ "$auth" != 0 ]]; then
+        cat <<EOF
+vpn-$name shared (password-protected) via $jump.
+
+Hand these to the ONE person you want -- nobody else can use the share:
+  socks user : $user
+  password   : $pass
+
+They run:  tunnelyard join $name            (and paste the password when asked)
+or by hand:
+  $sshcmd -N -L $socks:127.0.0.1:$pport $jump
+  curl -x socks5h://$user:$pass@127.0.0.1:$socks http://<internal-host>
+
+Stop with 'tunnelyard unshare $name' (also stops when the tunnel goes down).
+EOF
+    else
+        cat <<EOF
+vpn-$name shared (NO password -- SHARE_AUTH=0) via $jump.
+
+A teammate with this repo runs 'tunnelyard join $name'. Or by hand:
+  $sshcmd -N -L $socks:127.0.0.1:$pport $jump
+  curl --socks5-hostname 127.0.0.1:$socks http://<internal-host>
+
+Stop with 'tunnelyard unshare $name' (also stops when the tunnel goes down).
+EOF
+    fi
+}
+
+cmd_unshare() {
+    local name="${1:-}" pf n
+    if [[ "$name" == "--all" || -z "$name" ]]; then
+        for pf in "$SHARE_RUN"/*.pid; do
+            [[ -e "$pf" ]] || continue
+            n="$(basename "$pf" .pid)"
+            kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+            rm -f "$pf"
+            _share_stop_proxy "$n"
+            _share_manifest_rm "$n"
+        done
+        echo "all shares stopped"; return
+    fi
+    if _share_active "$name"; then
+        kill "$(cat "$SHARE_RUN/$name.pid" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$SHARE_RUN/$name.pid"
+        _share_stop_proxy "$name"
+        _share_manifest_rm "$name"
+        echo "vpn-$name unshared"
+    else
+        # Not actively shared, but still clear anything left behind: a stale
+        # pidfile, an orphaned auth proxy, or an advertisement that outlived an
+        # earlier stop (e.g. the jump host was briefly unreachable then). This
+        # makes 'tunnelyard unshare' the reliable way to force-clean a leftover.
+        rm -f "$SHARE_RUN/$name.pid"
+        _share_stop_proxy "$name"
+        _share_manifest_rm "$name"
+        echo "vpn-$name is not actively shared -- cleared any leftover advertisement"
+    fi
+}
+
+cmd_shares() {
+    local pf name any=0
+    for pf in "$SHARE_RUN"/*.pid; do
+        [[ -e "$pf" ]] || continue
+        name="$(basename "$pf" .pid)"
+        if _share_active "$name"; then printf '%-14s shared\n' "$name"; any=1
+        else rm -f "$pf"; fi
+    done
+    [[ $any -eq 0 ]] && echo "(no active shares)"
+}
+
+# --- joining a teammate's shared tunnel -------------------------------------
+#
+# The mirror image of `tunnelyard share`: a teammate has advertised a live tunnel on
+# the jump host, and these pull it down so it appears as a plain SOCKS5 proxy on
+# 127.0.0.1 here. No customer credentials, no container -- just SSH to the jump
+# host both people can reach.
+
+cmd_available() {
+    local jump; jump="$(_share_conf SHARE_JUMP)"
+    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf and set the jump host"
+    local lines; lines="$(_available_fetch)" \
+        || die "could not reach the jump host ($jump) -- logged in? (tsh login)"
+    [[ -n "$lines" ]] || { echo "(no shares advertised on $jump)"; return; }
+    printf '%-16s %-12s %-5s %s\n' CUSTOMER OWNER AUTH STATUS
+    local line c o a st
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        c="$(_kv "$line" customer)"; [[ -n "$c" ]] || continue
+        o="$(_kv "$line" owner)"; a="$(_kv "$line" auth)"
+        [[ "$a" == 0 ]] && a="open" || a="pass"
+        st="available"; _join_active "$c" && st="joined -> 127.0.0.1:$(cat "$JOIN_RUN/$c.port" 2>/dev/null)"
+        printf '%-16s %-12s %-5s %s\n' "$c" "$o" "$a" "$st"
+    done <<EOF
+$lines
+EOF
+}
+
+cmd_join() {
+    local sel="${1:-}"
+    [[ -n "$sel" ]] || die "usage: tunnelyard join <customer>   (see 'tunnelyard available')"
+    local jump sshcmd
+    jump="$(_share_conf SHARE_JUMP)"; [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf"
+    sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
+
+    # Selection may be 'customer' or 'owner/customer' (to disambiguate when two
+    # teammates share the same customer).
+    local want_owner="" want_cust="$sel"
+    case "$sel" in */*) want_owner="${sel%%/*}"; want_cust="${sel##*/}" ;; esac
+
+    local lines; lines="$(_available_fetch)" \
+        || die "could not reach the jump host ($jump) -- logged in? (tsh login)"
+    local line c o match=""
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        c="$(_kv "$line" customer)"; o="$(_kv "$line" owner)"
+        [[ "$c" == "$want_cust" ]] || continue
+        [[ -z "$want_owner" || "$o" == "$want_owner" ]] || continue
+        match="$line"; break
+    done <<EOF
+$lines
+EOF
+    [[ -n "$match" ]] || die "no share '$sel' advertised on $jump (see 'tunnelyard available')"
+
+    c="$(_kv "$match" customer)"
+    local pport socks owner auth user
+    pport="$(_kv "$match" port)"; socks="$(_kv "$match" socks)"; owner="$(_kv "$match" owner)"
+    auth="$(_kv "$match" auth)"; [[ -n "$auth" ]] || auth=0
+    user="$(_kv "$match" user)"; [[ -n "$user" ]] || user=share
+    _join_active "$c" && die "already joined '$c' -- 'tunnelyard leave $c' first"
+
+    # Password-protected share: take the password the sharer gave you (out of
+    # band) so the printed commands are ready to paste. Enter to skip -- then
+    # supply user/pass to your own client. Never read from the manifest: it isn't
+    # there, by design.
+    local pass=""
+    if [[ "$auth" != 0 ]]; then
+        printf 'share "%s" is password-protected (socks user "%s").\n' "$c" "$user" >&2
+        printf 'paste the password %s gave you (enter to skip): ' "$owner" >&2
+        # Prefer the controlling terminal so the prompt works even when stdin is
+        # a pipe, but only if it can actually be opened -- `[[ -r /dev/tty ]]` is
+        # true even with no controlling tty, which then leaks redirection errors.
+        local _tty=""; { : </dev/tty; } 2>/dev/null && _tty=/dev/tty
+        if [[ -n "$_tty" ]]; then
+            local _old; _old="$(stty -g <"$_tty" 2>/dev/null || true)"
+            stty -echo <"$_tty" 2>/dev/null || true
+            IFS= read -r pass <"$_tty" || true
+            [[ -n "$_old" ]] && stty "$_old" <"$_tty" 2>/dev/null || true
+        else
+            IFS= read -r pass || true
+        fi
+        printf '\n' >&2
+    fi
+
+    # Open the proxy on the port the sharer used, so ssh/config entries written
+    # for that customer keep working. If it's taken locally, fall back to the
+    # jump-host port, else bail rather than silently landing somewhere surprising.
+    local lport="${socks:-$pport}"
+    if port_in_use "$lport"; then
+        if [[ -n "$pport" && "$pport" != "$lport" ]] && ! port_in_use "$pport"; then lport="$pport"
+        else die "local port $lport is already in use -- free it, then 'tunnelyard join $c' again"; fi
+    fi
+
+    mkdir -p "$JOIN_RUN" && chmod 700 "$JOIN_RUN"
+    local log="$JOIN_RUN/$c.log"
+    # Forward this machine's 127.0.0.1:<lport> down to the shared proxy that the
+    # sharer reverse-forwarded onto the jump host's 127.0.0.1:<pport>.
+    # shellcheck disable=SC2086
+    nohup $sshcmd -N -L "$lport:127.0.0.1:$pport" "$jump" </dev/null >"$log" 2>&1 &
+    echo $! > "$JOIN_RUN/$c.pid"
+    printf '%s\n' "$lport" > "$JOIN_RUN/$c.port"
+    disown 2>/dev/null || true
+
+    sleep 1
+    if ! _join_active "$c"; then
+        printf 'join failed -- is your session valid (tsh login)? See %s\n' "$log" >&2
+        tail -4 "$log" 2>/dev/null >&2 || true
+        rm -f "$JOIN_RUN/$c.pid" "$JOIN_RUN/$c.port"
+        return 1
+    fi
+
+    if [[ "$auth" != 0 ]]; then
+        local shown="${pass:-<password>}"
+        cat <<EOF
+joined '$c' (shared by $owner) -- password-protected SOCKS5 on 127.0.0.1:$lport
+
+Point a client at it (socks user "$user"):
+  curl -x socks5h://$user:$shown@127.0.0.1:$lport http://<internal-host>
+  browser / RDP: SOCKS5 127.0.0.1:$lport, username "$user", password as given
+Your traffic rides $owner's authenticated session.
+
+Stop with 'tunnelyard leave $c'.
+EOF
+    else
+        cat <<EOF
+joined '$c' (shared by $owner) -- SOCKS5 proxy now on 127.0.0.1:$lport
+
+Point a client at it:
+  curl --socks5-hostname 127.0.0.1:$lport http://<internal-host>
+  browser / RDP: set SOCKS5 proxy to 127.0.0.1:$lport
+Your traffic rides $owner's authenticated session.
+
+Stop with 'tunnelyard leave $c'.
+EOF
+    fi
+}
+
+cmd_leave() {
+    local name="${1:-}" pf
+    if [[ "$name" == "--all" || -z "$name" ]]; then
+        for pf in "$JOIN_RUN"/*.pid; do
+            [[ -e "$pf" ]] || continue
+            kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+            rm -f "$pf" "${pf%.pid}.port"
+        done
+        echo "left all shared connections"; return
+    fi
+    _join_active "$name" || { rm -f "$JOIN_RUN/$name.pid" "$JOIN_RUN/$name.port"; die "not joined to '$name'"; }
+    kill "$(cat "$JOIN_RUN/$name.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$JOIN_RUN/$name.pid" "$JOIN_RUN/$name.port"
+    echo "left '$name'"
+}
+
+cmd_joined() {
+    local pf name any=0 port
+    for pf in "$JOIN_RUN"/*.pid; do
+        [[ -e "$pf" ]] || continue
+        name="$(basename "$pf" .pid)"
+        if _join_active "$name"; then
+            port="$(cat "$JOIN_RUN/$name.port" 2>/dev/null)"
+            printf '%-14s joined  socks:127.0.0.1:%s\n' "$name" "${port:-?}"; any=1
+        else rm -f "$pf" "${pf%.pid}.port"; fi
+    done
+    [[ $any -eq 0 ]] && echo "(not joined to any shared connection)"
+}
+
+# TUI toggle: share if not shared, unshare if it is.
+_tui_share() {
+    local name="${1:-}"; [[ -n "$name" ]] || return 0
+    if _share_active "$name"; then "$ROOT/bin/tunnelyard" unshare "$name"
+    else "$ROOT/bin/tunnelyard" share "$name"; fi
+}
+
+# IP(s) assigned on the tunnel interface inside a running container.
+tunnel_ip() {
+    docker exec "vpn-$1" sh -c "ip -4 -br addr 2>/dev/null | grep -viE '^(lo|eth0)' | awk '{print \$3}' | head -1" 2>/dev/null
+}
+
+cmd_restart() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard restart <customer>"
+    envfile_for "$name" >/dev/null
+    exists "$name" && docker rm -f "vpn-$name" >/dev/null
+    cmd_up "$name"
+}
+
+cmd_info() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard info <customer>"
+    envfile_for "$name" >/dev/null
+    _tui_preview "$name"
+}
+
+# Open a customer's config in the user's editor ($VISUAL/$EDITOR, else a
+# sensible fallback). Unquoted expansion of $ed on purpose, so EDITOR="code -w"
+# and the like keep their arguments.
+cmd_edit() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: tunnelyard edit <customer>"
+    local f; f="$(envfile_for "$name")"
+    local ed="${VISUAL:-${EDITOR:-}}" c
+    if [[ -z "$ed" ]]; then
+        for c in nvim vim nano vi; do command -v "$c" >/dev/null 2>&1 && { ed="$c"; break; }; done
+    fi
+    [[ -n "$ed" ]] || die "no editor found -- set \$EDITOR (e.g. export EDITOR=nvim)"
+    # shellcheck disable=SC2086
+    exec $ed "$f"
+}
+
+# Probe one customer (or all) and report, bypassing the cache. Exits non-zero
+# unless every tunnel asked about is genuinely carrying traffic, so it is usable
+# from a script or a shell prompt.
+cmd_health() {
+    local name="${1:-}" rc=0 st n any=0
+    if [[ -z "$name" ]]; then
+        for n in $(docker ps --format '{{.Names}}' | grep '^vpn-' || true); do
+            # Skip containers with no customer config (e.g. vpn-selftest);
+            # envfile_for would die and take the whole sweep with it.
+            [[ -f "$CUSTOMERS/${n#vpn-}.conf" ]] || continue
+            any=1
+            cmd_health "${n#vpn-}" || rc=1
+        done
+        (( any )) || echo "no tunnels running"
+        return $rc
+    fi
+    envfile_for "$name" >/dev/null
+    st="$(_health "$name" fresh)"
+    printf '%-14s %s\n' "$name" "$(_health_label "$st")"
+    [[ "$st" == up ]]
+}
+
+cmd_watch() {
+    command -v watch >/dev/null || die "watch not installed (brew install watch)"
+    exec env VPN_FORCE_COLOR=1 watch -c -n 2 "$ROOT/bin/tunnelyard" status
+}
+
+# --- interactive TUI (fzf) --------------------------------------------------
+
+# One row per customer: name<TAB>dot<TAB>proto<TAB>socks<TAB>state. Field 1 is
+# the plain name, used by the key bindings; the rest are for display.
+_tui_rows() {
+    local GRN=$'\033[32m' YEL=$'\033[33m' RED=$'\033[31m' DIM=$'\033[2m' RST=$'\033[0m'
+    local f b proto port dot state ip
+    _health_warm
+    for f in "$CUSTOMERS"/*.conf; do
+        [[ -e "$f" ]] || continue
+        b="$(basename "$f" .conf)"
+        [[ "$b" == _* ]] && continue
+        proto="$(read_var "$f" VPN_PROTOCOL)"
+        [[ -n "$proto" ]] || proto="$(read_var "$f" VPN_KIND)"
+        [[ "$(read_var "$f" VPN_STATUS)" == "pending" ]] && proto="$proto*"
+        port="$(read_var "$f" SOCKS_PORT)"
+        case "$(_health "$b")" in
+            up)         ip="$(tunnel_ip "$b")"
+                        dot="${GRN}●${RST}"; state="${GRN}up${RST} ${ip:-}" ;;
+            stale)      ip="$(tunnel_ip "$b")"
+                        dot="${RED}✖${RST}"; state="${RED}STALE${RST} ${ip:-}" ;;
+            unverified) ip="$(tunnel_ip "$b")"
+                        dot="${YEL}●${RST}"; state="${YEL}up?${RST} ${ip:-}" ;;
+            connecting) dot="${YEL}◐${RST}"; state="${YEL}connecting${RST}" ;;
+            stopped)    dot="${YEL}◌${RST}"; state="${YEL}stopped${RST}" ;;
+            *)          dot="${DIM}○${RST}"; state="${DIM}down${RST}" ;;
+        esac
+        # Field 1 is the plain name (used by the key bindings). Field 2 is the
+        # pre-formatted, fixed-width display line -- fzf shows only field 2, so
+        # padding the name here keeps the columns aligned without polluting {1}.
+        printf '%s\t%s %-14s %-12s %-11s %s\n' \
+            "$b" "$dot" "$b" "$proto" "socks:$port" "$state"
+    done
+
+    # "shared by teammates" section: tunnels others advertised on the jump host.
+    # Only in the tmux TUI (VPN_TUI_SHARES=1), read from the cache cmd_tui warms
+    # and ^g refreshes -- never fetched here, so a slow/absent jump host can't
+    # stall the list. Field 1 is @owner/customer, which the enter/^d dispatchers
+    # recognise as a remote row and the other actions deliberately ignore.
+    local cache="$JOIN_RUN/available.cache"
+    if [[ "${VPN_TUI_SHARES:-0}" == 1 && -s "$cache" ]]; then
+        local line rc ro rp lp jdot jstate hdr=0
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            rc="$(_kv "$line" customer)"; [[ -n "$rc" ]] || continue
+            ro="$(_kv "$line" owner)"; rp="$(_kv "$line" port)"
+            if [[ $hdr -eq 0 ]]; then
+                printf '%s\t%s\n' '#shares' "${DIM}── shared by teammates ── enter to join${RST}"
+                hdr=1
+            fi
+            if _join_active "$rc"; then
+                lp="$(cat "$JOIN_RUN/$rc.port" 2>/dev/null)"
+                jdot="${GRN}⇄${RST}"; jstate="${GRN}joined${RST} socks:${lp:-?}"
+            else
+                jdot="${DIM}⇄${RST}"; jstate="${DIM}available${RST}"
+            fi
+            printf '%s\t%s %-14s %-12s %-11s %s\n' \
+                "@$ro/$rc" "$jdot" "$rc" "@$ro" "port:$rp" "$jstate"
+        done < "$cache"
+    fi
+}
+
+# Populate the available-shares cache from the jump host. Backgrounded by cmd_tui
+# at start and re-run by ^g; safe to call when no jump host is configured.
+_tui_refresh_available() {
+    mkdir -p "$JOIN_RUN" && chmod 700 "$JOIN_RUN"
+    if [[ -z "$(_share_conf SHARE_JUMP)" ]]; then : > "$JOIN_RUN/available.cache"; return; fi
+    local tmp="$JOIN_RUN/available.cache.tmp"
+    if _available_fetch > "$tmp" 2>/dev/null; then mv -f "$tmp" "$JOIN_RUN/available.cache"
+    else rm -f "$tmp"; fi
+}
+
+# Enter dispatcher: a normal customer row connects; an @owner/customer row joins
+# a teammate's share; the section header does nothing.
+_tui_enter() {
+    local sel="${1:-}"
+    case "$sel" in
+        ''|'#'*) return 0 ;;
+        '@'*)    _tui_spawn joinshare "${sel#@}" ;;
+        *)       _tui_spawn connect "$sel" ;;
+    esac
+}
+
+# ^d dispatcher: a customer row goes down; an @owner/customer row leaves the
+# joined share (keyed by the customer half of the name).
+_tui_downleave() {
+    local sel="${1:-}"
+    case "$sel" in
+        ''|'#'*) return 0 ;;
+        '@'*)    "$ROOT/bin/tunnelyard" leave "${sel##*/}" >/dev/null 2>&1 || true ;;
+        *)       "$ROOT/bin/tunnelyard" down "$sel" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+# Preview for the "shared by teammates" rows and their section header.
+_tui_preview_shared() {
+    local sel="${1:-}"
+    local BLD=$'\033[1m' DIM=$'\033[2m' GRN=$'\033[32m' RST=$'\033[0m'
+    if [[ "$sel" == '#'* ]]; then
+        printf '%sshared by teammates%s\n\n' "$BLD" "$RST"
+        printf 'Live tunnels other people running this repo have shared on your\n'
+        printf 'jump host. Enter joins one (opens a local SOCKS5 proxy that rides\n'
+        printf 'their session); ^d leaves; ^g refreshes the list.\n'
+        return
+    fi
+    local body owner cust
+    body="${sel#@}"; owner="${body%%/*}"; cust="${body##*/}"
+    printf '%s%s%s   (shared by %s)\n\n' "$BLD" "$cust" "$RST" "$owner"
+    if _join_active "$cust"; then
+        local lp; lp="$(cat "$JOIN_RUN/$cust.port" 2>/dev/null)"
+        printf '%sSTATE   : ⇄ joined%s\n\n' "$GRN" "$RST"
+        printf 'SOCKS5 on this machine : 127.0.0.1:%s\n' "${lp:-?}"
+        printf '  curl --socks5-hostname 127.0.0.1:%s http://<host>\n\n' "${lp:-?}"
+        printf '%s^d to leave.%s\n' "$DIM" "$RST"
+    else
+        printf '%sSTATE   : available%s\n\n' "$DIM" "$RST"
+        printf 'Press enter to join: opens a local SOCKS5 proxy routed through\n'
+        printf "%s's connection via the jump host.\n\n" "$owner"
+        # Flag password protection so the joiner knows to have the secret ready.
+        local aline; aline="$(_available_cached_line "$owner" "$cust")"
+        if [[ -n "$aline" && "$(_kv "$aline" auth)" != 0 ]]; then
+            printf '%sPassword-protected: enter will ask for the password %s\n' "$DIM" "$owner"
+            printf 'gave you (socks user "%s").%s\n\n' "$(_kv "$aline" user)" "$RST"
+        fi
+        printf '%sNote: your traffic is attributed to their VPN session.%s\n' "$DIM" "$RST"
+    fi
+}
+
+# The cached manifest line for one owner/customer, so the preview can show auth
+# details without another round-trip to the jump host.
+_available_cached_line() {
+    local owner="$1" cust="$2" cache="$JOIN_RUN/available.cache" line
+    [[ -s "$cache" ]] || return 0
+    while IFS= read -r line; do
+        [[ "$(_kv "$line" customer)" == "$cust" && "$(_kv "$line" owner)" == "$owner" ]] && { printf '%s' "$line"; return 0; }
+    done < "$cache"
+}
+
+_tui_preview() {
+    local name="${1:-}" f="$CUSTOMERS/${1:-}.conf"
+    case "$name" in '#'*|'@'*) _tui_preview_shared "$name"; return ;; esac
+    [[ -f "$f" ]] || { echo "no such customer: $name"; return; }
+    local GRN=$'\033[32m' YEL=$'\033[33m' RED=$'\033[31m' DIM=$'\033[2m' BLD=$'\033[1m' RST=$'\033[0m' fwd probe
+    printf '%s%s%s\n\n' "$BLD" "$name" "$RST"
+    printf 'server  : %s\n' "$(read_var "$f" VPN_SERVER)"
+    printf 'kind    : %s %s\n' "$(read_var "$f" VPN_KIND)" "$(read_var "$f" VPN_PROTOCOL)"
+    printf 'socks   : 127.0.0.1:%s\n' "$(read_var "$f" SOCKS_PORT)"
+    fwd="$(read_var "$f" FORWARDS)"; [[ -n "$fwd" ]] && printf 'forwards: %s\n' "$fwd"
+    probe="$(_probe_target "$f")"
+    echo
+
+    # Always probed fresh: this pane is what the user reads before trusting the
+    # tunnel, so a cached verdict is the wrong trade here.
+    case "$(_health "$name" fresh)" in
+        up)
+            printf '%sSTATE   : ● up%s   (verified: %s answered)\n\n' \
+                "$GRN" "$RST" "${probe:-tunnel}" ;;
+        stale)
+            printf '%sSTATE   : ✖ STALE%s\n\n' "$RED" "$RST"
+            printf '%sPackets go into the tunnel and nothing comes back.%s\n' "$RED" "$RST"
+            printf '%s%s did not answer and the interface received no return\n' "$DIM" "${probe:-the probe target}"
+            printf 'traffic -- the gateway has almost certainly expired the\n'
+            printf 'session. Press ^r to reconnect.%s\n\n' "$RST" ;;
+        unverified)
+            printf '%sSTATE   : ● up (unverified)%s\n\n' "$YEL" "$RST"
+            printf '%sNo HEALTH_PROBE and no FORWARDS, so the data path cannot be\n' "$DIM"
+            printf 'tested. Set HEALTH_PROBE=host:port to have this checked.%s\n\n' "$RST" ;;
+        connecting)
+            printf '%sSTATE   : ◐ connecting%s\n\n' "$YEL" "$RST" ;;
+        stopped)
+            printf '%sSTATE   : ◌ stopped%s\n\n(press enter to reconnect)\n' "$YEL" "$RST"
+            return ;;
+        *)
+            printf '%sSTATE   : ○ down%s\n\n(press enter to connect)\n' "$DIM" "$RST"
+            return ;;
+    esac
+
+    if _share_active "$name"; then
+        printf '%sshared  : ⇄ yes (^p to stop)%s\n' "$GRN" "$RST"
+        [[ -f "$SHARE_RUN/$name.pass" ]] && \
+            printf '%s          socks user "share", password %s%s\n' "$DIM" "$(cat "$SHARE_RUN/$name.pass" 2>/dev/null)" "$RST"
+        echo
+    fi
+    docker exec "vpn-$name" sh -c '
+        echo "interface:"; ip -4 -br addr 2>/dev/null | grep -viE "^(lo|eth0)" | sed "s/^/  /"
+        echo "routes:";    ip route 2>/dev/null | grep -vE "eth0|^default" | sed "s/^/  /"' 2>/dev/null
+    echo; echo "--- recent log ---"
+    docker logs --tail 8 "vpn-$name" 2>&1 | sed 's/^/  /'
+}
+
+# ssh from the TUI: find ssh/config hosts whose ProxyCommand uses this
+# customer's SOCKS port, then connect (choosing among several with fzf).
+_tui_ssh() {
+    local name="${1:-}" cfg="$ROOT/ssh/config"
+    [[ -f "$cfg" ]] || { echo "no ssh/config yet -- copy ssh/config.example first"; sleep 3; return; }
+    local port; port="$(read_var "$CUSTOMERS/$name.conf" SOCKS_PORT)"
+    local aliases=() a
+    while read -r a; do
+        [[ -z "$a" || "$a" == "*" ]] && continue
+        ssh -F "$cfg" -G "$a" 2>/dev/null | grep -qiE "proxycommand.*:$port( |$)" && aliases+=("$a")
+    done < <(grep -iE '^[[:space:]]*Host[[:space:]]' "$cfg" | awk '{for(i=2;i<=NF;i++) print $i}')
+
+    if [[ ${#aliases[@]} -eq 0 ]]; then
+        echo "no ssh/config host uses $name's socks port ($port). Add one:"
+        echo "    Host <alias>"
+        echo "        ProxyCommand ncat --proxy 127.0.0.1:$port --proxy-type socks5 %h %p"
+        sleep 4; return
+    fi
+    is_up "$name" || { echo "warning: vpn-$name is not up -- connect it first"; sleep 1; }
+    local target="${aliases[0]}"
+    [[ ${#aliases[@]} -gt 1 ]] && { target="$(printf '%s\n' "${aliases[@]}" | fzf --prompt='ssh host> ' --height 40%)" || return; }
+    exec ssh -F "$cfg" "$target"
+}
+
+# Open a TUI action in a tmux pane beside the list, so its prompts/output are
+# visible and interactive while the list stays put. Refreshes the list pane when
+# the action finishes; pauses a failed one so the error stays readable.
+_tui_spawn() {
+    local kind="${1:-}" name="${2:-}"
+    [[ -n "$name" ]] || return 0
+    # Remote-share rows (@owner/customer) and the section header (#...) only
+    # answer to enter (join) and ^d (leave), routed via joinshare below. Every
+    # other action is customer-only, so ignore those keys on a shared row rather
+    # than feeding a bogus name to 'tunnelyard up/down/edit/...'.
+    case "$kind:$name" in
+        joinshare:*) : ;;
+        *:'#'*|*:'@'*) return 0 ;;
+    esac
+    command -v tmux >/dev/null 2>&1 || return 0
+    # pause: fail = pause only on error; always = pause when the command ends;
+    # never = close immediately. Keeps a successful connect auto-closing while
+    # logs (which exits fast for a stopped tunnel) stays readable.
+    local vpn="$ROOT/bin/tunnelyard" inner pause=fail
+    case "$kind" in
+        connect)   inner="'$vpn' up '$name' --bg" ;;
+        joinshare) inner="'$vpn' join '$name'"; pause=always ;;
+        restart) inner="'$vpn' down '$name' >/dev/null 2>&1; '$vpn' up '$name' --bg" ;;
+        rdp)     inner="'$vpn' rdp '$name'" ;;
+        ssh)     inner="'$vpn' __tui-ssh '$name'" ;;
+        share)   inner="'$vpn' __tui-share '$name'"; pause=always ;;
+        cmd)     inner="'$vpn' __tui-run '$name'"; pause=never ;;
+        shell)   inner="'$vpn' shell '$name'" ;;
+        logs)    inner="'$vpn' logs '$name' -f 2>&1"; pause=always ;;
+        edit)    inner="'$vpn' edit '$name'"; pause=never ;;
+        *)       return 0 ;;
+    esac
+    local fzfpane; fzfpane="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
+    # `read -r _` (wait for Enter) is portable across sh/bash/zsh, unlike the
+    # bash-only `read -rsn1` that closed the pane instantly under zsh.
+    local pausecmd
+    case "$pause" in
+        always) pausecmd='printf "\n[ended -- press ENTER to close] "; read -r _' ;;
+        never)  pausecmd=':' ;;
+        *)      pausecmd='[ $ec -ne 0 ] && { printf "\n[exit %s -- press ENTER to close] " "$ec"; read -r _; }' ;;
+    esac
+    local pane_cmd="$inner; ec=\$?; $pausecmd; tmux send-keys -t '$fzfpane' F5"
+    if [[ "${VPN_TUI_DRYRUN:-0}" == 1 ]]; then
+        printf 'tmux split-window -h -l 48%% %q\n' "$pane_cmd"
+        return 0
+    fi
+    tmux split-window -h -l 48% "$pane_cmd"
+}
+
+# Shared fzf invocation. mode=tmux opens actions in a side pane; mode=plain
+# takes over the screen (the fallback when tmux is unavailable).
+_tui_fzf() {
+    local self="$1" mode="$2"
+    local common=(
+        --ansi --delimiter $'\t' --with-nth '2' --nth '2'
+        --no-sort --reverse --height '100%' --border
+        --preview "$self __tui-preview {1}" --preview-window 'right,42%,wrap'
+    )
+    if [[ "$mode" == tmux ]]; then
+        _tui_rows | fzf "${common[@]}" \
+            --header $'enter connect/join  ^d down/leave  ^r restart  ^o edit  ^t rdp  ^n cmd\n^s ssh  ^l logs  ^e shell  ^p share  ^g refresh-shares  ^x stop-all  esc quit' \
+            --bind "enter:execute-silent($self __tui-enter {1})" \
+            --bind "ctrl-d:execute-silent($self __tui-downleave {1})+reload($self __tui-rows)" \
+            --bind "ctrl-r:execute-silent($self __tui-spawn restart {1})" \
+            --bind "ctrl-o:execute-silent($self __tui-spawn edit {1})" \
+            --bind "ctrl-t:execute-silent($self __tui-spawn rdp {1})" \
+            --bind "ctrl-p:execute-silent($self __tui-spawn share {1})" \
+            --bind "ctrl-n:execute-silent($self __tui-spawn cmd {1})" \
+            --bind "ctrl-s:execute-silent($self __tui-spawn ssh {1})" \
+            --bind "ctrl-l:execute-silent($self __tui-spawn logs {1})" \
+            --bind "ctrl-e:execute-silent($self __tui-spawn shell {1})" \
+            --bind "ctrl-g:execute-silent($self __tui-refresh)+reload($self __tui-rows)" \
+            --bind "ctrl-x:execute-silent($self down --all >/dev/null 2>&1)+reload($self __tui-rows)" \
+            --bind "f5:reload($self __tui-rows)" \
+            >/dev/null || true
+    else
+        _tui_rows | fzf "${common[@]}" \
+            --header $'enter connect  ^d down  ^r restart  ^o edit  ^t rdp\n^s ssh  ^l logs  ^e shell  ^p share  ^x stop-all  esc quit' \
+            --bind "enter:execute($self up {1} --bg)+reload($self __tui-rows)" \
+            --bind "ctrl-d:execute-silent($self down {1} >/dev/null 2>&1)+reload($self __tui-rows)" \
+            --bind "ctrl-r:execute($self restart {1})+reload($self __tui-rows)" \
+            --bind "ctrl-o:execute($self edit {1})+reload($self __tui-rows)" \
+            --bind "ctrl-t:execute($self rdp {1})+reload($self __tui-rows)" \
+            --bind "ctrl-p:execute($self share {1})+reload($self __tui-rows)" \
+            --bind "ctrl-s:execute($self __tui-ssh {1})" \
+            --bind "ctrl-l:execute($self logs {1} 2>&1 | less -R)" \
+            --bind "ctrl-e:execute($self shell {1})" \
+            --bind "ctrl-x:execute-silent($self down --all >/dev/null 2>&1)+reload($self __tui-rows)" \
+            --bind "f5:reload($self __tui-rows)" \
+            >/dev/null || true
+    fi
+}
+
+cmd_tui() {
+    command -v fzf >/dev/null || die "fzf not installed (brew install fzf) -- use 'tunnelyard status' / 'tunnelyard watch'"
+    local self="$ROOT/bin/tunnelyard"
+    # Side-pane actions need tmux. Outside tmux, re-enter inside a session so the
+    # split works. VPN_TUI_PLAIN=1 keeps the old full-screen behaviour.
+    if command -v tmux >/dev/null 2>&1 && [[ "${VPN_TUI_PLAIN:-0}" != 1 ]]; then
+        # Not already in tmux: launch on a dedicated server (own socket + config)
+        # with mouse-copy enabled, so drag-to-copy works and the user's own tmux
+        # setup is untouched. Already in tmux: use the current session as-is.
+        if [[ -z "${TMUX:-}" ]]; then
+            # VPN_CUSTOMERS is passed explicitly: the -L vpntui server may already
+            # be running, and tmux hands a new session the SERVER's environment,
+            # not this shell's -- so an override would be silently dropped and
+            # the TUI would show the default customers instead.
+            exec tmux -L vpntui -f "$ROOT/libexec/tui.tmux.conf" \
+                new-session "exec env VPN_CUSTOMERS='$CUSTOMERS' '$self' tui"
+        fi
+        # Show the "shared by teammates" section, and warm its cache in the
+        # background so the list appears instantly even if the jump host is slow.
+        export VPN_TUI_SHARES=1
+        "$self" __tui-refresh >/dev/null 2>&1 &
+        _tui_fzf "$self" tmux
+    else
+        _tui_fzf "$self" plain
+    fi
+}
+
+cmd_help() {
+    cat <<'EOF'
+usage: tunnelyard <command> [args]
+
+  build                 build (or rebuild) the vpn-base image
+  list                  show configured customers
+  status                show running tunnels, verified health, and host ports
+  health [customer]     probe the data path and report up/stale; exits non-zero
+                        unless the tunnel is really carrying traffic
+  up <customer> [--bg]  start a tunnel (prompts for password / MFA;
+                        --bg auto-backgrounds it once connected)
+  restart <customer>    stop and reconnect a tunnel
+  auth <customer>       run the logon only, no tunnel -- diagnostic
+  probe <customer>      list the logon page's form fields -- diagnostic
+  down <customer>       stop a tunnel
+  down --all            stop every tunnel
+  info <customer>       show a tunnel's live details (IP, routes, log)
+  edit <customer>       open the customer's config in $EDITOR
+  attach <customer>     re-attach to a tunnel's console (for reconnect prompts)
+  shell <customer>      open a shell inside a tunnel container
+  logs <customer> [-f]  show a tunnel's log
+  ssh <host> [args]     ssh to an internal host via its proxy (see ssh/config)
+  run <customer> [label] run a saved CMD_<label> command inside the tunnel
+  rdp <customer> [ip]   RDP to a Windows host in a browser (ip/user from
+                        RDP_SERVER/RDP_USER in the config if omitted)
+  rdp-logs <customer>   show an RDP session's log
+  rdp-stop <customer>   stop an RDP session (--all for every one)
+  share <customer>      share the tunnel's proxy with a teammate (see share.conf)
+  unshare <customer>    stop sharing (--all for every one)
+  shares                list tunnels you are sharing
+  available             list tunnels teammates are sharing on the jump host
+  join <customer>       connect to a teammate's shared tunnel (local SOCKS5 proxy)
+  leave <customer>      disconnect from a joined share (--all for every one)
+  joined                list shared tunnels you have joined
+  watch                 live-updating status table (every 2s)
+  tui                   interactive manager (fzf); in tmux, actions open in a
+                        side pane (VPN_TUI_PLAIN=1 for old full-screen)
+  selftest              verify the container plumbing without a real VPN
+
+Detach from a tunnel console with ctrl-p ctrl-q. Closing it with ctrl-c
+stops the tunnel.
+EOF
+}
+
+case "${1:-help}" in
+    build)    shift; cmd_build "$@" ;;
+    up)       shift; cmd_up "$@" ;;
+    restart)  shift; cmd_restart "$@" ;;
+    auth)     shift; cmd_auth "$@" ;;
+    probe)    shift; cmd_probe "$@" ;;
+    down)     shift; cmd_down "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    health)   shift; cmd_health "$@" ;;
+    list)     shift; cmd_list "$@" ;;
+    info)     shift; cmd_info "$@" ;;
+    edit)     shift; cmd_edit "$@" ;;
+    attach)   shift; cmd_attach "$@" ;;
+    shell)    shift; cmd_shell "$@" ;;
+    logs)     shift; cmd_logs "$@" ;;
+    ssh)      shift; cmd_ssh "$@" ;;
+    run)      shift; cmd_run "$@" ;;
+    rdp)      shift; cmd_rdp "$@" ;;
+    rdp-logs) shift; cmd_rdp_logs "$@" ;;
+    rdp-stop) shift; cmd_rdp_stop "$@" ;;
+    share)    shift; cmd_share "$@" ;;
+    unshare)  shift; cmd_unshare "$@" ;;
+    shares)   shift; cmd_shares "$@" ;;
+    available|avail) shift; cmd_available "$@" ;;
+    join)     shift; cmd_join "$@" ;;
+    leave)    shift; cmd_leave "$@" ;;
+    joined)   shift; cmd_joined "$@" ;;
+    watch)    shift; cmd_watch "$@" ;;
+    tui|ui)   shift; cmd_tui "$@" ;;
+    __tui-rows)    _tui_rows ;;
+    __tui-preview) shift; _tui_preview "$@" ;;
+    __tui-ssh)     shift; _tui_ssh "$@" ;;
+    __tui-run)     shift; _tui_run "$@" ;;
+    __tui-share)   shift; _tui_share "$@" ;;
+    __tui-enter)   shift; _tui_enter "$@" ;;
+    __tui-downleave) shift; _tui_downleave "$@" ;;
+    __tui-refresh) _tui_refresh_available ;;
+    __tui-spawn)   shift; _tui_spawn "$@" ;;
+    selftest) shift; cmd_selftest "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)        die "unknown command '$1' (try 'tunnelyard help')" ;;
+esac
