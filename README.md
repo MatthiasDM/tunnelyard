@@ -30,9 +30,7 @@ Pulse/Ivanti, F5, FortiGate, Juniper NC and Array; `openfortivpn`, `openvpn`,
 `wireguard` and `strongSwan` cover the rest. Which one a customer uses is a line
 in its config, not a different tool to learn.
 
-## Setup
-
-Needs Docker (OrbStack or Docker Desktop), plus `fzf` for the TUI.
+## Installation
 
 **Platforms.** Developed and used daily on macOS. Linux should work — the
 host-side paths (`xdg-open`, `xclip`/`wl-copy`, `--add-host` for
@@ -41,25 +39,76 @@ unverified and report what breaks. Windows would need WSL2 and is not
 supported. Everything inside the tunnel is Linux regardless: that is where the
 VPN client actually runs.
 
-Then:
+**1. Install the requirements.**
+
+| Needed for | Install |
+|---|---|
+| everything | Docker: [OrbStack](https://orbstack.dev) or Docker Desktop, running |
+| the TUI | `fzf`, plus `tmux` for side panes: `brew install fzf tmux` |
+| export, import, 1Password auto-fill, password-protected sharing | `python3` (already on most systems) |
+| 1Password auto-fill, optional | the 1Password CLI `op`: `brew install 1password-cli` |
+
+**2. Get the code.** Clone it wherever you keep projects. The checkout is what
+you will run, so leave it in place.
+
+```bash
+git clone https://github.com/MatthiasDM/tunnelyard.git
+cd tunnelyard
+```
+
+**3. Check the plumbing.**
 
 ```bash
 ./bin/tunnelyard selftest
 ```
 
 That builds the image and verifies the tun device, the SOCKS proxy and a TCP
-forward end to end, without touching a real VPN.
+forward end to end, without touching a real VPN. It ends with `selftest passed`.
 
-Then make `tunnelyard` work from any directory. From the repo root:
+**4. Run it from anywhere.** Still in the repo root, link the script into
+`~/.local/bin`:
 
 ```bash
 mkdir -p ~/.local/bin && ln -sf "$PWD/bin/tunnelyard" ~/.local/bin/tunnelyard
 ```
 
-If a new terminal then says `tunnelyard: command not found`, `~/.local/bin` is
-not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`
-(or `~/.bashrc`). The link follows the repo, so a `git pull` is all an update
-takes.
+The link points at this checkout, and the script follows it back to find the
+repo, so it works from any directory. Open a new terminal and check:
+
+```bash
+command -v tunnelyard
+```
+
+If that prints nothing, `~/.local/bin` is not on your PATH yet. Add it to your
+shell's startup file, `~/.zshrc` on macOS or `~/.bashrc` on most Linux systems,
+then open a new terminal:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Want a shorter name too? Link it a second time, for example as `ty`:
+`ln -sf "$PWD/bin/tunnelyard" ~/.local/bin/ty`.
+
+**5. Add your customers.** Your configs live in `~/.config/tunnelyard`, outside
+the repo. Got an export from a colleague? Install it with:
+
+```bash
+tunnelyard import ~/Downloads/tunnelyard-configs-<date>.tar.gz
+```
+
+Then set your own username per customer with `tunnelyard edit <customer>`. To
+start from scratch instead, see [Adding a customer](#adding-a-customer).
+
+**6. Start it.**
+
+```bash
+tunnelyard
+```
+
+**Updating** is a `git pull` in the checkout. The link keeps pointing at it, so
+nothing needs reinstalling. **Uninstalling** is `rm ~/.local/bin/tunnelyard`.
+Your configs stay in `~/.config/tunnelyard` until you delete that folder too.
 
 ## Start here: the TUI
 
