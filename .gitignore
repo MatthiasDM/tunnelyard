@@ -1,3 +1,6 @@
+# Personal config lives in ~/.config/tunnelyard, not here. These patterns stay as a
+# guard, so a file copied into the repo by habit can never be committed.
+
 # Customer configs carry usernames, gateway hostnames and internal addresses.
 customers/*.conf
 !customers/_template.conf
@@ -28,6 +31,9 @@ share.conf
 
 # Per-customer browser profiles (proxy prefs, cookies, session state)
 browser-profiles/
+
+# Config exports (they list customer gateways and internal IPs)
+*configs*.tar.gz
 
 # macOS folder metadata
 .DS_Store

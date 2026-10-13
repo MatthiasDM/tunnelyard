@@ -7,7 +7,8 @@
 # Runs on the Mac (via a CMD_<label>=@host ... entry), not in the container --
 # a tunnel container has no desktop to put a browser on.
 #
-# Each customer gets its own Firefox profile under browser-profiles/<customer>,
+# Each customer gets its own Firefox profile under
+# ~/.config/tunnelyard/browser-profiles/<customer>,
 # whose user.js pins that tunnel's SOCKS port with REMOTE DNS. Remote DNS is the
 # part that matters: internal manager hostnames generally have no public record,
 # so the name has to be resolved by the customer's resolvers inside the tunnel.
@@ -19,8 +20,8 @@ name="${1:?usage: open-manager <customer> <socks-port> <url>}"
 port="${2:?missing socks port}"
 url="${3:?missing url}"
 
-root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-profile="$root/browser-profiles/$name"
+conf="${TUNNELYARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunnelyard}"
+profile="$conf/browser-profiles/$name"
 # macOS keeps the real binary inside the bundle; elsewhere it is on PATH.
 for cand in /Applications/Firefox.app/Contents/MacOS/firefox \
             "$HOME/Applications/Firefox.app/Contents/MacOS/firefox" \
@@ -62,5 +63,5 @@ if pgrep -f "browser-profiles/$name" >/dev/null 2>&1; then
 fi
 
 echo "opening $url"
-echo "  via SOCKS 127.0.0.1:$port (remote DNS), profile browser-profiles/$name"
+echo "  via SOCKS 127.0.0.1:$port (remote DNS), profile $profile"
 nohup env MOZ_NO_REMOTE=1 "$ff" --profile "$profile" --no-remote "$url" >/dev/null 2>&1 &

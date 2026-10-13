@@ -12,10 +12,15 @@ while [[ -L "$_src" ]]; do
     [[ "$_src" != /* ]] && _src="$_dir/$_src"
 done
 ROOT="$(cd -P "$(dirname "$_src")/.." && pwd)"
-# Overridable so docs, screenshots and demos can point at a throwaway set of
-# configs without touching (or listing) your real customers:
+# Everything personal lives outside the repo, in one directory:
+#   customers/<name>.conf  ssh/config  share.conf  config/  browser-profiles/
+# TUNNELYARD_CONFIG moves all of it. Exported so the libexec helpers agree.
+CONFIG_DIR="${TUNNELYARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tunnelyard}"
+export TUNNELYARD_CONFIG="$CONFIG_DIR"
+# VPN_CUSTOMERS moves only the customer configs, so docs, screenshots and demos
+# can point at a throwaway set without touching (or listing) your real ones:
 #   VPN_CUSTOMERS=docs/demo-customers tunnelyard tui
-CUSTOMERS="${VPN_CUSTOMERS:-$ROOT/customers}"
+CUSTOMERS="${VPN_CUSTOMERS:-$CONFIG_DIR/customers}"
 # Resolved to an absolute path: a relative VPN_CUSTOMERS must survive both the
 # tmux re-exec below and any change of working directory in a spawned pane.
 if [[ -d "$CUSTOMERS" ]]; then CUSTOMERS="$(cd -P "$CUSTOMERS" && pwd)"; fi
@@ -23,6 +28,9 @@ IMAGE="${VPN_IMAGE:-vpn-base:latest}"
 DETACH_KEYS='ctrl-p,ctrl-q'
 
 die() { printf 'tunnelyard: %s\n' "$*" >&2; exit 1; }
+
+# A path for messages, with $HOME shortened to ~.
+_shown() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 
 # Open a URL in the desktop's default browser. macOS has `open`, most Linux
 # desktops have `xdg-open`; on a headless box neither exists and we just print.
@@ -46,7 +54,7 @@ read_var() {
 
 envfile_for() {
     local f="$CUSTOMERS/$1.conf"
-    [[ -f "$f" ]] || die "no config at customers/$1.conf (see 'tunnelyard list')"
+    [[ -f "$f" ]] || die "no config at $(_shown "$CUSTOMERS/$1.conf") (see 'tunnelyard list')"
     printf '%s' "$f"
 }
 
@@ -246,12 +254,12 @@ cmd_up() {
     _health_forget "$name"
 
     [[ "$(read_var "$envfile" VPN_STATUS)" == "pending" ]] && \
-        die "vpn-$name is marked pending in customers/$name.conf (not runnable yet -- see that file)"
+        die "vpn-$name is marked pending in $(_shown "$CUSTOMERS/$name.conf") (not runnable yet -- see that file)"
 
     local socks forwards
     socks="$(read_var "$envfile" SOCKS_PORT)"
     forwards="$(read_var "$envfile" FORWARDS)"
-    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in $(_shown "$CUSTOMERS/$name.conf")"
 
     local args=(
         -it --detach-keys="$DETACH_KEYS"
@@ -264,10 +272,10 @@ cmd_up() {
     )
 
     # Profiles and certs (openvpn / wireguard / client-cert auth) live here.
-    [[ -d "$ROOT/config" ]] && args+=(-v "$ROOT/config:/config:ro")
+    [[ -d "$CONFIG_DIR/config" ]] && args+=(-v "$CONFIG_DIR/config:/config:ro")
 
     # Preflight every host port so a clash gives a clear message, not docker's.
-    port_in_use "$socks" && die "host port $socks (SOCKS_PORT) is already in use -- pick another in customers/$name.conf"
+    port_in_use "$socks" && die "host port $socks (SOCKS_PORT) is already in use -- pick another in $(_shown "$CUSTOMERS/$name.conf")"
     if [[ -n "$forwards" ]]; then
         local saved_ifs="$IFS" fwd lport
         IFS=','
@@ -275,7 +283,7 @@ cmd_up() {
             IFS="$saved_ifs"
             [[ -n "$fwd" ]] || continue
             lport="${fwd%%:*}"
-            port_in_use "$lport" && die "host port $lport (a FORWARDS entry) is already in use -- change its left-hand port in customers/$name.conf"
+            port_in_use "$lport" && die "host port $lport (a FORWARDS entry) is already in use -- change its left-hand port in $(_shown "$CUSTOMERS/$name.conf")"
             args+=(-p "127.0.0.1:$lport:$lport")
             IFS=','
         done
@@ -401,6 +409,8 @@ cmd_list() {
             "$proto" \
             "$(read_var "$f" VPN_SERVER)"
     done
+    compgen -G "$CUSTOMERS/[!_]*.conf" >/dev/null || \
+        printf '\nno customer configs in %s -- start from the repo'"'"'s customers/_template.conf\n' "$(_shown "$CUSTOMERS")" >&2
 }
 
 # Fetch the logon page and list its form fields. Unauthenticated -- no
@@ -411,7 +421,7 @@ cmd_probe() {
     [[ -n "$name" ]] || die "usage: tunnelyard probe <customer>"
     local envfile; envfile="$(envfile_for "$name")"
     local server; server="$(read_var "$envfile" VPN_SERVER)"
-    [[ -n "$server" ]] || die "VPN_SERVER not set in customers/$name.conf"
+    [[ -n "$server" ]] || die "VPN_SERVER not set in $(_shown "$CUSTOMERS/$name.conf")"
     [[ "$server" == http://* || "$server" == https://* ]] || server="https://$server"
 
     docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
@@ -451,7 +461,7 @@ cmd_auth() {
         -e "VPN_NAME=$name"
         -e VPN_AUTH_ONLY=1
     )
-    [[ -d "$ROOT/config" ]] && args+=(-v "$ROOT/config:/config:ro")
+    [[ -d "$CONFIG_DIR/config" ]] && args+=(-v "$CONFIG_DIR/config:/config:ro")
 
     docker run "${args[@]}" "$IMAGE"
 }
@@ -475,15 +485,15 @@ cmd_logs() {
     docker logs "$@" "vpn-$name"
 }
 
-# ssh to a customer's internal host through its SOCKS proxy, using the repo's
-# ssh/config so the shortcuts live here, not in ~/.ssh/config.
+# ssh to a customer's internal host through its SOCKS proxy, using tunnelyard's
+# own ssh config so the shortcuts live there, not in ~/.ssh/config.
 cmd_ssh() {
-    local cfg="$ROOT/ssh/config"
+    local cfg="$CONFIG_DIR/ssh/config"
     if [[ ! -f "$cfg" ]]; then
-        die "no ssh/config yet -- copy ssh/config.example to ssh/config and add your hosts"
+        die "no $(_shown "$cfg") yet -- copy the repo's ssh/config.example there and add your hosts"
     fi
     if [[ $# -eq 0 ]]; then
-        echo "defined hosts (ssh/config):"
+        echo "defined hosts ($(_shown "$cfg")):"
         grep -iE '^[[:space:]]*Host[[:space:]]' "$cfg" | awk '{for(i=2;i<=NF;i++) if($i!="*") print "  "$i}'
         echo
         echo "usage: tunnelyard ssh <host> [ssh args...]   (bring the tunnel up first: tunnelyard up <customer>)"
@@ -539,7 +549,7 @@ cmd_run() {
         return 0
     fi
     local cmd; cmd="$(read_var "$envfile" "CMD_$label")"
-    [[ -n "$cmd" ]] || die "no command '$label' in customers/$name.conf (see 'tunnelyard run $name')"
+    [[ -n "$cmd" ]] || die "no command '$label' in $(_shown "$CUSTOMERS/$name.conf") (see 'tunnelyard run $name')"
     _run_in_tunnel "$name" "$cmd"
 }
 
@@ -558,7 +568,7 @@ _tui_run() {
         printf 'command (runs inside vpn-%s; prefix "@host " to run on your Mac): ' "$name"; read -r cmd
         [[ -n "$cmd" ]] || return 0
         printf 'CMD_%s=%s\n' "$label" "$cmd" >> "$envfile"
-        echo "saved CMD_$label to customers/$name.conf"
+        echo "saved CMD_$label to $(_shown "$CUSTOMERS/$name.conf")"
         choice="$label"
     fi
     cmd="$(read_var "$envfile" "CMD_$choice")"
@@ -625,13 +635,13 @@ cmd_rdp() {
     # Fall back to the customer config so `tunnelyard rdp <customer>` (and the TUI) work
     # with no args once RDP_SERVER / RDP_USER are set there.
     [[ -n "$server" ]]  || server="$(read_var "$envfile" RDP_SERVER)"
-    [[ -n "$server" ]]  || die "no RDP server -- pass one, or set RDP_SERVER in customers/$name.conf"
+    [[ -n "$server" ]]  || die "no RDP server -- pass one, or set RDP_SERVER in $(_shown "$CUSTOMERS/$name.conf")"
     [[ -n "$userarg" ]] || userarg="$(read_var "$envfile" RDP_USER)"
 
     is_up "$name" || die "vpn-$name is not up -- 'tunnelyard up $name' first (RDP rides its tunnel)"
 
     local socks; socks="$(read_var "$envfile" SOCKS_PORT)"
-    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in $(_shown "$CUSTOMERS/$name.conf")"
     local web=$(( socks + 5000 ))     # 1083 -> 6083, stable per customer
     local geo; geo="$(read_var "$envfile" RDP_GEOMETRY)"
 
@@ -694,8 +704,8 @@ cmd_rdp_stop() {
 SHARE_RUN="${TMPDIR:-/tmp}/vpn-share-$(id -u)"    # tunnels *I* am offering
 JOIN_RUN="${TMPDIR:-/tmp}/vpn-join-$(id -u)"      # teammates' shares *I* have joined
 
-_share_conf() {  # arg: KEY -> value from the gitignored share.conf, or empty
-    local f="$ROOT/share.conf"
+_share_conf() {  # arg: KEY -> value from share.conf in the config dir, or empty
+    local f="$CONFIG_DIR/share.conf"
     # Must succeed even when share.conf is absent: callers do
     # `x="$(_share_conf KEY)"`, and under `set -e` a non-zero return here would
     # kill the process at that assignment -- before the explicit "no SHARE_JUMP,
@@ -802,11 +812,11 @@ cmd_share() {
 
     local jump sshcmd bind socks pport auth
     jump="$(_share_conf SHARE_JUMP)"
-    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf and set the jump host"
+    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy the repo's share.conf.example to $(_shown "$CONFIG_DIR/share.conf") and set the jump host"
     sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
     bind="$(_share_conf SHARE_BIND)"; [[ -n "$bind" ]] || bind="127.0.0.1"
     socks="$(read_var "$envfile" SOCKS_PORT)"
-    [[ -n "$socks" ]] || die "SOCKS_PORT not set in customers/$name.conf"
+    [[ -n "$socks" ]] || die "SOCKS_PORT not set in $(_shown "$CUSTOMERS/$name.conf")"
     pport="$(_share_conf SHARE_PORT)"; [[ -n "$pport" ]] || pport="$socks"
     auth="$(_share_conf SHARE_AUTH)"; [[ -n "$auth" ]] || auth=1   # password-protect by default
 
@@ -820,7 +830,7 @@ cmd_share() {
     # lands on. SHARE_AUTH=0 forwards the tunnel's proxy directly (no password).
     local target="$socks" pass="" user="share"
     if [[ "$auth" != 0 ]]; then
-        command -v python3 >/dev/null 2>&1 || die "password-protected sharing needs python3 (or set SHARE_AUTH=0 in share.conf)"
+        command -v python3 >/dev/null 2>&1 || die "password-protected sharing needs python3 (or set SHARE_AUTH=0 in $(_shown "$CONFIG_DIR/share.conf"))"
         local aport; aport="$(_free_local_port $((socks + 10000)))"
         pass="$(_gen_pass)"
         SHARE_PROXY_PASS="$pass" nohup python3 "$ROOT/libexec/authproxy.py" \
@@ -937,7 +947,7 @@ cmd_shares() {
 
 cmd_available() {
     local jump; jump="$(_share_conf SHARE_JUMP)"
-    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf and set the jump host"
+    [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy the repo's share.conf.example to $(_shown "$CONFIG_DIR/share.conf") and set the jump host"
     local lines; lines="$(_available_fetch)" \
         || die "could not reach the jump host ($jump) -- logged in? (tsh login)"
     [[ -n "$lines" ]] || { echo "(no shares advertised on $jump)"; return; }
@@ -959,7 +969,7 @@ cmd_join() {
     local sel="${1:-}"
     [[ -n "$sel" ]] || die "usage: tunnelyard join <customer>   (see 'tunnelyard available')"
     local jump sshcmd
-    jump="$(_share_conf SHARE_JUMP)"; [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy share.conf.example to share.conf"
+    jump="$(_share_conf SHARE_JUMP)"; [[ -n "$jump" ]] || die "no SHARE_JUMP -- copy the repo's share.conf.example to $(_shown "$CONFIG_DIR/share.conf") and set the jump host"
     sshcmd="$(_share_conf SHARE_SSH)"; [[ -n "$sshcmd" ]] || sshcmd="tsh ssh"
 
     # Selection may be 'customer' or 'owner/customer' (to disambiguate when two
@@ -1356,8 +1366,8 @@ _tui_preview() {
 # ssh from the TUI: find ssh/config hosts whose ProxyCommand uses this
 # customer's SOCKS port, then connect (choosing among several with fzf).
 _tui_ssh() {
-    local name="${1:-}" cfg="$ROOT/ssh/config"
-    [[ -f "$cfg" ]] || { echo "no ssh/config yet -- copy ssh/config.example first"; sleep 3; return; }
+    local name="${1:-}" cfg="$CONFIG_DIR/ssh/config"
+    [[ -f "$cfg" ]] || { echo "no $(_shown "$cfg") yet -- copy the repo's ssh/config.example there first"; sleep 3; return; }
     local port; port="$(read_var "$CUSTOMERS/$name.conf" SOCKS_PORT)"
     local aliases=() a
     while read -r a; do
@@ -1366,7 +1376,7 @@ _tui_ssh() {
     done < <(grep -iE '^[[:space:]]*Host[[:space:]]' "$cfg" | awk '{for(i=2;i<=NF;i++) print $i}')
 
     if [[ ${#aliases[@]} -eq 0 ]]; then
-        echo "no ssh/config host uses $name's socks port ($port). Add one:"
+        echo "no host in $(_shown "$cfg") uses $name's socks port ($port). Add one:"
         echo "    Host <alias>"
         echo "        ProxyCommand ncat --proxy 127.0.0.1:$port --proxy-type socks5 %h %p"
         sleep 4; return
@@ -1419,11 +1429,14 @@ _tui_spawn() {
         *)      pausecmd='[ $ec -ne 0 ] && { printf "\n[exit %s -- press ENTER to close] " "$ec"; read -r _; }' ;;
     esac
     local pane_cmd="$inner; ec=\$?; $pausecmd; tmux send-keys -t '$fzfpane' F5"
+    # A new pane gets the tmux server's environment, not ours, so hand the
+    # config location over explicitly or an override would silently be lost.
+    local penv=(-e "TUNNELYARD_CONFIG=$CONFIG_DIR" -e "VPN_CUSTOMERS=$CUSTOMERS")
     if [[ "${VPN_TUI_DRYRUN:-0}" == 1 ]]; then
-        printf 'tmux split-window -h -l 48%% %q\n' "$pane_cmd"
+        printf 'tmux split-window %s -h -l 48%% %q\n' "${penv[*]}" "$pane_cmd"
         return 0
     fi
-    tmux split-window -h -l 48% "$pane_cmd"
+    tmux split-window "${penv[@]}" -h -l 48% "$pane_cmd"
 }
 
 # Shared fzf invocation. mode=tmux opens actions in a side pane; mode=plain
@@ -1480,12 +1493,13 @@ cmd_tui() {
         # with mouse-copy enabled, so drag-to-copy works and the user's own tmux
         # setup is untouched. Already in tmux: use the current session as-is.
         if [[ -z "${TMUX:-}" ]]; then
-            # VPN_CUSTOMERS is passed explicitly: the -L vpntui server may already
+            # VPN_CUSTOMERS and TUNNELYARD_CONFIG are passed explicitly: the
+            # -L vpntui server may already
             # be running, and tmux hands a new session the SERVER's environment,
             # not this shell's -- so an override would be silently dropped and
             # the TUI would show the default customers instead.
             exec tmux -L vpntui -f "$ROOT/libexec/tui.tmux.conf" \
-                new-session "exec env VPN_CUSTOMERS='$CUSTOMERS' '$self' tui"
+                new-session "exec env VPN_CUSTOMERS='$CUSTOMERS' TUNNELYARD_CONFIG='$CONFIG_DIR' '$self' tui"
         fi
         # Show the "shared by teammates" section, and warm its cache in the
         # background so the list appears instantly even if the jump host is slow.
@@ -1501,6 +1515,7 @@ cmd_help() {
     cat <<'EOF'
 usage: tunnelyard <command> [args]
 
+  (no command)          open the TUI when run in a terminal, else print this
   build                 build (or rebuild) the vpn-base image
   list                  show configured customers
   status                show running tunnels, verified health, and host ports
@@ -1535,13 +1550,26 @@ usage: tunnelyard <command> [args]
   tui                   interactive manager (fzf); in tmux, actions open in a
                         side pane (VPN_TUI_PLAIN=1 for old full-screen)
   selftest              verify the container plumbing without a real VPN
+  export [file]         tarball of your config without usernames, passwords or
+                        1Password references, to hand to a colleague
+  import <file>         install a colleague's export into your config dir
+                        (never overwrites a file you already have)
 
 Detach from a tunnel console with ctrl-p ctrl-q. Closing it with ctrl-c
 stops the tunnel.
+
+Your config lives in ~/.config/tunnelyard: customers/, ssh/config, share.conf
+and config/. Set TUNNELYARD_CONFIG to keep it somewhere else.
 EOF
 }
 
-case "${1:-help}" in
+# Bare `tunnelyard` in a terminal opens the TUI -- the day-to-day entry point.
+# Piped or scripted it prints help instead, so nothing ever blocks on fzf.
+if [[ $# -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then set -- tui; else set -- help; fi
+fi
+
+case "$1" in
     build)    shift; cmd_build "$@" ;;
     up)       shift; cmd_up "$@" ;;
     restart)  shift; cmd_restart "$@" ;;
@@ -1580,6 +1608,8 @@ case "${1:-help}" in
     __tui-refresh) _tui_refresh_available ;;
     __tui-spawn)   shift; _tui_spawn "$@" ;;
     selftest) shift; cmd_selftest "$@" ;;
+    export)   shift; exec python3 "$ROOT/libexec/export-configs" "$@" ;;
+    import)   shift; exec python3 "$ROOT/libexec/import-configs" "$@" ;;
     help|-h|--help) cmd_help ;;
     *)        die "unknown command '$1' (try 'tunnelyard help')" ;;
 esac
