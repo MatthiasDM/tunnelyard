@@ -323,7 +323,7 @@ EOF
     # Foreground and interactive so the terminal is attached before the login
     # script prompts. The PTY wrapper auto-detaches on the "connected" marker
     # (and, in 1Password mode, types the password/OTP at the prompts).
-    local marker='Configured as|Initialization Sequence Completed|wireguard up|IPsec established'
+    local marker='Configured as|Initialization Sequence Completed|wireguard up|IPsec established|Session will expire around'
     if [[ -n "$op_item" ]]; then
         OP_PASSWORD="$op_pass" OP_OTP="$op_otp" \
             python3 "$ROOT/libexec/autodetach.py" "$marker" \
@@ -425,6 +425,14 @@ cmd_probe() {
     [[ "$server" == http://* || "$server" == https://* ]] || server="https://$server"
 
     docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
+
+    # A Check Point gateway has no logon form worth scraping. Ask it for its
+    # login options over the client protocol instead; still unauthenticated.
+    if [[ "$(read_var "$envfile" VPN_KIND)" == "checkpoint" ]]; then
+        printf 'CCC ClientHello to %s (unauthenticated)\n\n' "$server"
+        docker run --rm --entrypoint checkpoint-client "$IMAGE" --login-options "$server"
+        return
+    fi
 
     printf 'GET %s (unauthenticated)\n\n' "$server"
     docker run --rm -e "PROBE_URL=$server" --entrypoint sh "$IMAGE" -c '
@@ -1525,7 +1533,7 @@ usage: tunnelyard <command> [args]
                         --bg auto-backgrounds it once connected)
   restart <customer>    stop and reconnect a tunnel
   auth <customer>       run the logon only, no tunnel -- diagnostic
-  probe <customer>      list the logon page's form fields -- diagnostic
+  probe <customer>      list the logon page's form fields (Check Point: its login options) -- diagnostic
   down <customer>       stop a tunnel
   down --all            stop every tunnel
   info <customer>       show a tunnel's live details (IP, routes, log)

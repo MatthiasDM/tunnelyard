@@ -377,10 +377,55 @@ EOF
     idle
 }
 
+# Check Point via cpyvpn. VPN_SERVER is the gateway host for the Endpoint-client
+# (TRAC) protocol, or an https://host/sslvpn/ URL for a Mobile Access portal
+# login. checkpoint-client wraps cp_client -- see that file for why.
+connect_checkpoint() {
+    : "${VPN_SERVER:?VPN_SERVER is required}"
+
+    # tun0 rather than cpyvpn's snxtun, so the tunnel looks like every other.
+    set -- -s /usr/local/bin/vpnc-wrapper -i tun0
+
+    if [ -n "${VPN_USER:-}" ];      then set -- "$@" -u "$VPN_USER"; fi
+    # A gateway can offer several login options ("realms"); pick by index,
+    # id or display name. With one option, or none set, cpyvpn asks or auto-picks.
+    if [ -n "${VPN_AUTHGROUP:-}" ]; then set -- "$@" -r "$VPN_AUTHGROUP"; fi
+    # Force the first factor type (l password, p/k SecurID, h challenge, m portal).
+    if [ -n "${VPN_CP_MODE:-}" ];   then set -- "$@" -m "$VPN_CP_MODE"; fi
+
+    # Client certificate as the first factor. cpyvpn wants one PEM holding
+    # certificate and key; a separate VPN_KEY is joined on the fly. An
+    # encrypted key is fine -- cpyvpn prompts "Certificate password".
+    if [ -n "${VPN_CERT:-}" ]; then
+        [ -f "$VPN_CERT" ] || die "client certificate not found at $VPN_CERT -- put the PEM under ~/.config/tunnelyard/config (see docs/CONFIGURING.md, Check Point)"
+        pem="$VPN_CERT"
+        if [ -n "${VPN_KEY:-}" ]; then
+            [ -f "$VPN_KEY" ] || die "client key not found at $VPN_KEY"
+            pem=/tmp/.client.pem
+            (umask 077; cat "$VPN_CERT" "$VPN_KEY" > "$pem")
+        fi
+        set -- "$@" -c "$pem"
+    fi
+
+    if [ "${VPN_AUTH_ONLY:-0}" = "1" ]; then
+        log "auth-only mode -- no tunnel will be established"
+    fi
+
+    # Deliberately unquoted: VPN_EXTRA carries additional cp_client flags.
+    if [ -n "${VPN_EXTRA:-}" ]; then
+        # shellcheck disable=SC2086
+        set -- "$@" $VPN_EXTRA
+    fi
+
+    log "connecting to $VPN_SERVER via cpyvpn (Check Point)"
+    exec checkpoint-client "$@" "$VPN_SERVER"
+}
+
 selftest() {
     log "tun:         $([ -c /dev/net/tun ] && echo present || echo MISSING)"
     log "openconnect: $(openconnect --version 2>&1 | head -1)"
     log "strongswan:  $(ipsec --version 2>&1 | head -1)"
+    log "cpyvpn:      $(checkpoint-client -v 2>&1 | head -1)"
     log "idle -- verifying socks/forwards plumbing, ctrl-c to stop"
     idle
 }
@@ -398,6 +443,7 @@ case "${VPN_KIND:-openconnect}" in
     openvpn)      connect_openvpn ;;
     wireguard)    connect_wireguard ;;
     strongswan)   connect_strongswan ;;
+    checkpoint)   connect_checkpoint ;;
     selftest)     selftest ;;
     *)            die "unknown VPN_KIND '${VPN_KIND}'" ;;
 esac

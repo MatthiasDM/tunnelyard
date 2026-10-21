@@ -17,6 +17,7 @@ commands, 1Password).
   - [IPsec (FortiClient / strongSwan)](#ipsec-forticlient--strongswan)
   - [OpenVPN](#openvpn)
   - [WireGuard](#wireguard)
+  - [Check Point](#check-point)
 - [Reaching customer hosts](#reaching-customer-hosts)
   - [SOCKS proxy](#socks-proxy)
   - [Port forwards](#port-forwards)
@@ -110,7 +111,7 @@ the 1100+ range; `tunnelyard list` shows what's already taken.
 | Key | Required | Meaning |
 |---|---|---|
 | `SOCKS_PORT` | yes | Host port for this customer's SOCKS5 proxy (`127.0.0.1:<port>`). Must be unique per customer. |
-| `VPN_KIND` | yes | Client to use: `openconnect`, `openfortivpn`, `openvpn`, `wireguard`, or `strongswan`. |
+| `VPN_KIND` | yes | Client to use: `openconnect`, `openfortivpn`, `openvpn`, `wireguard`, `strongswan`, or `checkpoint`. |
 | `VPN_PROTOCOL` | openconnect only | `anyconnect`, `gp`, `pulse`, `f5`, `fortinet`, `nc`, or `array`. |
 | `VPN_SERVER` | most | Gateway host, `host:port`, or `https://host/path`. |
 | `VPN_USER` | usually | Login username. Left blank ⇒ the client prompts (or 1Password fills it). |
@@ -148,6 +149,16 @@ the 1100+ range; `tunnelyard list` shows what's already taken.
 | Key | Meaning |
 |---|---|
 | `VPN_CONFIG` | Path (inside the container) to the profile, e.g. `/config/client.ovpn` or `/config/wg.conf`. Put the file in `~/.config/tunnelyard/config`. |
+
+### Check Point (cpyvpn)
+
+| Key | Meaning |
+|---|---|
+| `VPN_SERVER` | Gateway host for the Endpoint-client protocol, or `https://host/sslvpn/` to log in through a Mobile Access portal instead. |
+| `VPN_CERT` / `VPN_KEY` | Client certificate as the first factor. One PEM with certificate and key in `VPN_CERT`, or the two split; an encrypted key is prompted for ("Certificate password"). |
+| `VPN_AUTHGROUP` | Which login option ("realm") to use when the gateway offers several — its index, id or display name. `tunnelyard probe <customer>` lists them. |
+| `VPN_CP_MODE` | Force the first factor type: `l` password, `p` / `k` SecurID pinpad / keyfob, `h` challenge, `m` portal. Normally empty: cpyvpn reads it from the login option. |
+| `VPN_EXTRA` | Extra `cp_client` flags, e.g. `--os Linux`, `-t esp`, `--loglevel DEBUG`. |
 
 ### Routing / DNS
 
@@ -378,6 +389,74 @@ cp ~/Downloads/acme.conf ~/.config/tunnelyard/config/acme-wg.conf
 
 > Drop any `DNS =` line that points at a resolver you can't reach, and keep
 > `AllowedIPs` scoped to the customer's subnets.
+
+### Check Point
+
+Check Point gateways — Endpoint Security VPN, Capsule, Harmony Endpoint, Mobile
+Access — have no openconnect support. `VPN_KIND=checkpoint` drives them with
+[cpyvpn](https://gitlab.com/cpvpn/cpyvpn), a pure-Python client for the same
+CCC / SSL Network Extender protocol the vendor clients speak. **Experimental:**
+the login-option exchange is verified against a production gateway; a full
+certificate login and tunnel has not been exercised yet.
+
+Start by asking the gateway what it wants. Nothing is authenticated:
+
+```bash
+tunnelyard probe acme
+```
+
+That prints the login options ("realms") with their factors — for example
+`certificate`, then `username_only` labelled "Password" — and whether the
+gateway demands an endpoint-compliance scan (`run_ics`), which this client
+cannot satisfy.
+
+Username + password:
+
+```conf
+SOCKS_PORT=1110
+VPN_KIND=checkpoint
+VPN_SERVER=vpn.customer.example.com
+VPN_USER=jdoe
+# VPN_AUTHGROUP=vpn_Users         # a login option's id or display name, if several
+```
+
+Certificate as the first factor (a second factor, if the option has one, is
+prompted with the gateway's own label):
+
+```conf
+SOCKS_PORT=1110
+VPN_KIND=checkpoint
+VPN_SERVER=vpn.customer.example.com
+VPN_CERT=/config/acme-client.pem
+```
+
+cpyvpn reads one PEM holding certificate and key. Convert a `.p12` once, keeping
+the key encrypted:
+
+```bash
+openssl pkcs12 -in acme.p12 -out ~/.config/tunnelyard/config/acme-client.pem
+```
+
+It asks for the import password and then a PEM pass phrase; at connect cpyvpn
+asks "Certificate password" for that pass phrase. Add `-legacy` if OpenSSL 3
+refuses an old `.p12`. The gateway validates the certificate against its own
+CAs, so if the `.p12` did not carry the issuing (intermediate) CA, append that
+CA certificate to the PEM. `~/.config/tunnelyard/config` is mounted read-only
+at `/config`.
+
+```bash
+tunnelyard auth acme            # log in, print the granted route ranges, sign out -- no tunnel
+tunnelyard up acme
+```
+
+> **Notes.** cpyvpn 1.6.4's vpnc-script mode is broken upstream; the image runs
+> it through `checkpoint-client.py`, which repairs it. Throughput is 2–3× below
+> a native client, which only shows on fast links. Portal mode
+> (`VPN_SERVER=https://host/sslvpn/`) emulates the browser login form, so a
+> portal that bounces to a SAML identity provider will not work. **1Password:**
+> leave `OP_ITEM` empty for certificate customers — the auto-fill types the
+> item's password at the first password-looking prompt, which here is the
+> certificate pass phrase.
 
 ---
 
@@ -620,6 +699,10 @@ docker build --build-arg BASE=debian:sid -t vpn-base-next:latest .
 | GlobalProtect "Failed to parse server response" | Challenge 2FA on old openconnect — pin the newer image. |
 | No traffic though the tunnel is "up" | Split tunnel with ESP not established, or posture gating. For Pulse/GP try `VPN_EXTRA=--no-dtls`. |
 | `tunnelyard run` says "not found" | The container predates a tool added to the image — `tunnelyard restart <customer>` to recreate it. |
+| `Certificate-based login mode selected, but user certificate is not set` (Check Point) | The login option's first factor is a certificate: set `VPN_CERT`. |
+| `[SSL] PEM lib` error at connect (Check Point) | `VPN_CERT` is not a PEM — convert the `.p12` as shown under [Check Point](#check-point). |
+| `TLS handshake refused by the gateway` (Check Point) | The gateway dropped the connection on its certificate-login URL: it does not trust the client certificate. Wrong certificate, or the PEM lacks the issuing CA chain — see [Check Point](#check-point). |
+| `Authentication error: … (code=…)` (Check Point) | The gateway rejected the login; the message is the gateway's own. |
 | Tunnel drops after minutes idle | Gateway idle timeout — keep traffic flowing (e.g. `ServerAliveInterval` for SSH). |
 
 See the top-level [README](../README.md) for the command reference and the TUI.
