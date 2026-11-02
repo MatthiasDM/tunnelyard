@@ -2,9 +2,18 @@
 # Render a remote RDP desktop into a browser (noVNC), reaching the host through
 # a SOCKS5 proxy (the customer tunnel). The chain is:
 #
-#   Xvfb (headless X)  <-  xfreerdp (draws the remote desktop into Xvfb)
-#        |                      \__ /proxy:socks5://<tunnel socks> /v:<server>
-#   x11vnc (exports Xvfb over VNC)  ->  websockify + noVNC  ->  browser
+#   Xvnc (X server + VNC server in one)  <-  xfreerdp (draws into it, +clipboard)
+#        |                                       \__ /proxy:socks5://<socks> /v:<server>
+#        \__ RFB :5900  ->  websockify + noVNC  ->  browser
+#
+# Clipboard: Xvnc (TigerVNC) syncs the X CLIPBOARD and PRIMARY selections with
+# the browser natively and bidirectionally (SendCutText / AcceptCutText /
+# SendPrimary / SetPrimary, all on by default). This replaces the earlier
+# Xvfb + x11vnc + autocutsel stack, whose clipboard worked only once: x11vnc
+# cannot forward the CLIPBOARD selection on its own (it reads CUT_BUFFER0), so
+# autocutsel was needed to bridge them -- but autocutsel and xfreerdp then
+# fought over ownership of the CLIPBOARD selection and the sync stalled after
+# the first transfer. Xvnc owns the VNC side alone, so there is no such fight.
 #
 # Env: RDP_SERVER (required), RDP_SOCKS (host:port, required), RDP_WEB (web port),
 #      RDP_GEOMETRY, RDP_USER, RDP_DOMAIN, RDP_PASS.
@@ -19,33 +28,20 @@ DPY=":0"
 
 log() { printf '[rdp] %s\n' "$*" >&2; }
 
-# Headless X server.
-Xvfb "$DPY" -screen 0 "${GEO}x24" -nolisten tcp >/tmp/xvfb.log 2>&1 &
+# Headless X server + VNC server in one process (TigerVNC). It renders the
+# desktop and exports it over RFB on :5900, bound to localhost (reached only
+# through the web port below). No password: the port is loopback-only and the
+# web port in front is what callers use. Clipboard sync (both selections, both
+# directions) is on by default -- see the header.
+Xvnc "$DPY" -rfbport 5900 -localhost -SecurityTypes None \
+    -geometry "$GEO" -depth 24 -desktop "rdp" -AlwaysShared \
+    >/tmp/xvnc.log 2>&1 &
 export DISPLAY="$DPY"
 i=0
 while ! xdpyinfo >/dev/null 2>&1; do
-    i=$((i + 1)); [ "$i" -gt 40 ] && { log "Xvfb did not start"; cat /tmp/xvfb.log >&2; exit 1; }
+    i=$((i + 1)); [ "$i" -gt 40 ] && { log "Xvnc did not start"; cat /tmp/xvnc.log >&2; exit 1; }
     sleep 0.25
 done
-
-# Clipboard bridge. Copy/paste between the browser and the remote Windows
-# desktop crosses three hand-offs: noVNC <-> x11vnc (VNC CutText), x11vnc <->
-# the X selections, and the X selections <-> xfreerdp (+clipboard, below). The
-# middle leg is the weak one: this is a bare Xvfb with no window manager, so
-# nothing holds ownership of the CLIPBOARD and PRIMARY selections, and the
-# ownership hand-offs between xfreerdp and x11vnc are dropped -- which is why
-# copy/paste silently does nothing. autocutsel keeps both selections owned and
-# mirrored to the cut buffer, so x11vnc and xfreerdp exchange clipboard text
-# reliably. One instance per selection; x11vnc reads the cut buffer they keep.
-# Backgrounded with & like the other services -- its own -fork does not reliably
-# detach here, and a foreground autocutsel would hang the entrypoint before
-# x11vnc ever starts.
-autocutsel -display "$DPY" -selection CLIPBOARD >/tmp/autocutsel.log 2>&1 &
-autocutsel -display "$DPY" -selection PRIMARY  >>/tmp/autocutsel.log 2>&1 &
-
-# Export the display over VNC (localhost only; reached solely via the web port).
-x11vnc -display "$DPY" -forever -shared -nopw -quiet -localhost -rfbport 5900 \
-    >/tmp/x11vnc.log 2>&1 &
 
 # Serve the noVNC web client + websocket bridge to the VNC port.
 websockify --web /usr/share/novnc "$WEB" localhost:5900 >/tmp/ws.log 2>&1 &
