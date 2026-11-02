@@ -28,6 +28,21 @@ while ! xdpyinfo >/dev/null 2>&1; do
     sleep 0.25
 done
 
+# Clipboard bridge. Copy/paste between the browser and the remote Windows
+# desktop crosses three hand-offs: noVNC <-> x11vnc (VNC CutText), x11vnc <->
+# the X selections, and the X selections <-> xfreerdp (+clipboard, below). The
+# middle leg is the weak one: this is a bare Xvfb with no window manager, so
+# nothing holds ownership of the CLIPBOARD and PRIMARY selections, and the
+# ownership hand-offs between xfreerdp and x11vnc are dropped -- which is why
+# copy/paste silently does nothing. autocutsel keeps both selections owned and
+# mirrored to the cut buffer, so x11vnc and xfreerdp exchange clipboard text
+# reliably. One instance per selection; x11vnc reads the cut buffer they keep.
+# Backgrounded with & like the other services -- its own -fork does not reliably
+# detach here, and a foreground autocutsel would hang the entrypoint before
+# x11vnc ever starts.
+autocutsel -display "$DPY" -selection CLIPBOARD >/tmp/autocutsel.log 2>&1 &
+autocutsel -display "$DPY" -selection PRIMARY  >>/tmp/autocutsel.log 2>&1 &
+
 # Export the display over VNC (localhost only; reached solely via the web port).
 x11vnc -display "$DPY" -forever -shared -nopw -quiet -localhost -rfbport 5900 \
     >/tmp/x11vnc.log 2>&1 &

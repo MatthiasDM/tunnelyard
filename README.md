@@ -281,6 +281,17 @@ machine, but don't run this on a shared host. The desktop is a fixed 1440×900
 scaled to your browser window; the built image is `vpn-rdp` (kept separate so
 the VPN base image stays small).
 
+**Copy and paste.** Clipboard text passes both ways between your machine and the
+remote Windows desktop. On the remote side it is automatic (`xfreerdp
++clipboard`, bridged into the headless X session by `autocutsel` so the
+selection hand-offs don't get dropped). On the browser side it goes through
+noVNC's own clipboard, not your system clipboard directly: open the clipboard
+panel in the noVNC toolbar (the control bar on the left edge of the tab) to see
+what the remote copied, and to paste text in — type or paste into that box and
+it becomes available to paste inside the remote session. This is a browser
+sandbox limit, not a tunnelyard one: a page can't silently read your system
+clipboard.
+
 **Lockout-safe retries.** The password is fixed once the session starts, so a
 wrong one is never re-submitted in a loop (which would trip the AD account
 lockout). A failed connect retries **once** and then stops — set
