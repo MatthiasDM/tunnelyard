@@ -42,9 +42,14 @@ import subprocess
 import sys
 from urllib import error
 
-from cpyvpn import auth, client, ssl_ctx, utils, vna
+from cpyvpn import auth, cfg, client, ssl_ctx, utils, vna
 
 log = logging.getLogger()
+
+# Last raw CCC response text, stashed so a bad return_code (which cpyvpn turns
+# into a bare CCCBadRetCode carrying only the number) can still be explained
+# with the gateway's own words.
+_last_raw = {}
 
 
 # --- 1. repair the vpnc-script adapter --------------------------------------
@@ -130,7 +135,80 @@ def login_options(argv):
     print(json.dumps(rd, indent=2, ensure_ascii=False))
 
 
-# --- 3. VPN_AUTH_ONLY=1 -----------------------------------------------------
+# --- 3. say what the gateway answers at each login step -----------------------
+#
+# cpyvpn re-prompts on every "continue" and only surfaces the gateway's text
+# on the final refusal, so a password rejected three times looks like three
+# silent prompts. Log the gateway's own fields per step -- status, prompt,
+# message, code. These are server-side strings; the user's input never
+# appears here, and request bodies are not logged.
+
+def _descramble(d, keys):
+    out = dict(d)
+    for k in keys:
+        if out.get(k):
+            try:
+                out[k] = auth.dec(out[k])
+            except Exception:
+                pass
+    return out
+
+
+def install_auth_trace():
+    orig_https = utils.do_https_request
+
+    def do_https_request(url, data=None, **kw):
+        ret = orig_https(url, data=data, **kw)
+        # Stash the response text (not the request, which carries the password).
+        _last_raw["text"] = ret if isinstance(ret, str) else None
+        return ret
+
+    utils.do_https_request = do_https_request
+
+    orig = utils.do_ccc_request
+
+    def do_ccc_request(url, data=None, **kw):
+        try:
+            ret = orig(url, data=data, **kw)
+        except utils.CCCBadRetCode as e:
+            # cpyvpn raised on return_code != 600 and kept only the number.
+            # Recover the gateway's own error text from the stashed response.
+            detail = ""
+            raw = _last_raw.get("text")
+            if raw:
+                try:
+                    rd = cfg.CPRR(raw).find("ResponseData") or {}
+                    shown = _descramble(rd, ("error_message", "prompt"))
+                    if shown.get("active_key"):
+                        shown["active_key"] = "<present>"
+                    detail = " -- " + json.dumps(shown, ensure_ascii=False)
+                except Exception:
+                    pass
+            log.info("gateway: return_code %s from %s%s", e.code, url, detail)
+            raise
+        rd = ret.find("ResponseData")
+        if isinstance(rd, dict) and any(k in rd for k in ("authn_status", "error_message", "error_code")):
+            # Dump the whole ResponseData. It is the gateway's own reply, so no
+            # password is in it; the two obfuscated text fields are de-scrambled
+            # for readability, and active_key (the session token on success) is
+            # masked. Every other field is kept as the gateway sent it, which is
+            # what shows the factor structure and session_id.
+            shown = dict(rd)
+            for k in ("prompt", "error_message"):
+                if shown.get(k):
+                    try:
+                        shown[k] = auth.dec(shown[k])
+                    except Exception:
+                        pass
+            if shown.get("active_key"):
+                shown["active_key"] = "<present>"
+            log.info("gateway ResponseData: %s", json.dumps(shown, ensure_ascii=False))
+        return ret
+
+    utils.do_ccc_request = do_ccc_request
+
+
+# --- 4. VPN_AUTH_ONLY=1 -----------------------------------------------------
 
 def install_auth_only():
     orig_ranges = utils.get_ranges
@@ -162,21 +240,50 @@ def main():
     if "--login-options" in argv:
         login_options([a for a in argv if a != "--login-options"])
         return
+    install_auth_trace()
     if os.environ.get("VPN_AUTH_ONLY") == "1":
         install_auth_only()
     try:
         client.main()
     except ssl.SSLError as e:
-        # A gateway that does not trust the client certificate drops the TLS
-        # handshake on its certificate-login URL instead of answering; the
-        # resulting traceback says nothing useful. Verified against a real
-        # gateway with a self-signed certificate: SSLV3_ALERT_HANDSHAKE_FAILURE.
-        log.error("TLS handshake refused by the gateway: %s", e)
-        if os.environ.get("VPN_CERT"):
-            log.error("The gateway does not accept this client certificate: wrong "
-                      "certificate, or the PEM lacks the issuing (intermediate) CA "
-                      "certificates -- append them to the PEM, below the key.")
+        # Two very different failures arrive as ssl.SSLError with an unhelpful
+        # traceback. "PEM lib" is local: the PEM could not be read, which with
+        # an encrypted key means a wrong certificate pass phrase. A handshake
+        # alert is the gateway dropping the TLS handshake on its
+        # certificate-login URL because it does not trust the client
+        # certificate (verified against a real gateway with a self-signed one:
+        # SSLV3_ALERT_HANDSHAKE_FAILURE).
+        if "PEM lib" in str(e):
+            log.error("could not read the client certificate PEM: %s", e)
+            log.error("With an encrypted key this is a wrong certificate pass phrase; "
+                      "otherwise the file is not a PEM with certificate and key.")
+        else:
+            log.error("TLS handshake refused by the gateway: %s", e)
+            if os.environ.get("VPN_CERT"):
+                log.error("The gateway does not accept this client certificate: wrong "
+                          "certificate, or the PEM lacks the issuing (intermediate) CA "
+                          "certificates -- append them to the PEM, below the key.")
         sys.exit(1)
+    except utils.CCCBadRetCode as e:
+        # A non-600 return code mid-login. The gateway's own words were already
+        # logged by the trace wrapper; here, just end cleanly instead of dumping
+        # a Python traceback, and name the common cause.
+        log.error("the gateway refused the login (return_code %s).", e.code)
+        if str(e.code) == "601":
+            log.error("601 follows repeated wrong-password attempts: either this "
+                      "login's attempt limit was hit (rerun for a fresh session) or "
+                      "the account is temporarily locked. Confirm the LDAP password "
+                      "first -- resetting it in the account portal also clears the lock.")
+        sys.exit(1)
+    except Exception as e:
+        # cpyvpn signals a rejected credential with a plain Exception whose text
+        # is the gateway's. Surface just that line; re-raise anything else so a
+        # real bug still shows its traceback.
+        msg = str(e)
+        if msg.startswith("Authentication error:"):
+            log.error("%s", msg)
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
