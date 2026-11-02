@@ -27,8 +27,8 @@ curl --socks5-hostname      │  microsocks :1080           │
 
 One client covers most gateways: `openconnect` speaks AnyConnect, GlobalProtect,
 Pulse/Ivanti, F5, FortiGate, Juniper NC and Array; `openfortivpn`, `openvpn`,
-`wireguard` and `strongSwan` cover the rest. Which one a customer uses is a line
-in its config, not a different tool to learn.
+`wireguard`, `strongSwan` and `cpyvpn` (Check Point) cover the rest. Which one a
+customer uses is a line in its config, not a different tool to learn.
 
 ## Installation
 
@@ -198,6 +198,7 @@ protocol matching the vendor client you are replacing:
 | Juniper Network Connect | `openconnect` / `nc` |
 | OpenVPN Connect | `openvpn` |
 | WireGuard | `wireguard` |
+| Check Point Endpoint Security / Capsule / Harmony Endpoint | `checkpoint` (cpyvpn; experimental) |
 
 Got an export from a colleague? `tunnelyard import <file>` puts it in place
 without overwriting anything you have; see "Sharing your configs" in
@@ -590,13 +591,21 @@ that enforce endpoint posture will authenticate you and then refuse the tunnel:
 - **FortiClient ZTNA**
 - **F5 Endpoint Inspection**, unless the cookie hand-off above holds
 
-Two vendors have no open client at all:
+**Check Point** is covered separately: `VPN_KIND=checkpoint` drives the gateway
+with [cpyvpn](https://gitlab.com/cpvpn/cpyvpn), a pure-Python client for the
+same protocol the vendor clients speak, certificate logins included. It is
+experimental — the login exchange is verified against a production gateway, a
+full connect is not yet; see "Check Point" in
+[docs/CONFIGURING.md](docs/CONFIGURING.md). Portal logins that bounce to a SAML
+identity provider are not covered.
 
-- **Check Point Endpoint Security VPN** — no `openconnect` support
+One vendor has no open client at all:
+
 - **Sophos Connect** — IPsec/strongSwan; the `strongswan` `VPN_KIND` (see
   "FortiClient IPsec" below) could be adapted to it, but it is not wired up
 
-For those, run the vendor client in a macOS VM (VirtualBuddy or UTM), enable
+For that, and for the posture-gated gateways above, run the vendor client in a
+macOS VM (VirtualBuddy or UTM), enable
 Remote Login in the guest, and expose it the same way as everything else:
 
 ```bash

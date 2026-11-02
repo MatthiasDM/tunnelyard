@@ -28,11 +28,22 @@ RUN apt-get update \
       dnsutils \
       curl \
       ca-certificates \
+      python3 \
+      python3-venv \
  && rm -rf /var/lib/apt/lists/*
+
+# Check Point: cpyvpn, a pure-Python client for the TRAC / SSL Network Extender
+# protocol (GPLv3). Pinned, in its own venv so it never touches the system
+# python. The connector runs it through checkpoint-client, which repairs its
+# vpnc-script mode and adds the probe / auth-only modes -- see that file.
+RUN python3 -m venv /opt/cpyvpn \
+ && /opt/cpyvpn/bin/pip install --no-cache-dir cpyvpn==1.6.4
 
 COPY entrypoint.sh /usr/local/bin/entrypoint
 COPY vpnc-wrapper.sh /usr/local/bin/vpnc-wrapper
 COPY f5-login.sh /usr/local/bin/f5-login
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/vpnc-wrapper /usr/local/bin/f5-login
+COPY checkpoint-client.py /usr/local/bin/checkpoint-client
+RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/vpnc-wrapper /usr/local/bin/f5-login \
+             /usr/local/bin/checkpoint-client
 
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
